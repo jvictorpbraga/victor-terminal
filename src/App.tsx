@@ -70,53 +70,50 @@ export default function App() {
 
   return (
     <div className="app">
-      <div className="titlebar" data-tauri-drag-region>
-        <span className="titlebar-title">
-          claude-terminal
-          <span className={`mode-pill ${mode === "tui" ? "mode-pill-tui" : ""}`}>
-            {mode}
-          </span>
-          {usagePctRounded != null && (
-            <span
-              className={`usage-pill ${usageColor}`}
-              title={`${formatNum(usage!.used)} / ${formatNum(usage!.limit)} tokens (${usage!.model})`}
-            >
-              {usagePctRounded}%
+      <div className="titlebar">
+        {/* Dedicated drag handle — fills the leftover space between content and buttons */}
+        <div className="titlebar-drag" data-tauri-drag-region>
+          <span className="titlebar-title">
+            <span>claude-terminal</span>
+            <span className={`mode-pill ${mode === "tui" ? "mode-pill-tui" : ""}`}>
+              {mode}
             </span>
-          )}
+            {usagePctRounded != null && (
+              <span
+                className={`usage-pill ${usageColor}`}
+                title={`${formatNum(usage!.used)} / ${formatNum(usage!.limit)} tokens (${usage!.model})`}
+              >
+                {usagePctRounded}%
+              </span>
+            )}
+          </span>
+        </div>
+        <button
+          className="titlebar-link"
+          onClick={() => setLedgerOpen((v) => !v)}
+          title="Open session ledger"
+        >
+          Ledger
+        </button>
+        <div className="traffic-lights">
           <button
-            className="titlebar-link"
-            onClick={() => setLedgerOpen((v) => !v)}
-            title="Open session ledger"
-          >
-            Ledger
-          </button>
-        </span>
-        <div className="titlebar-controls">
-          <button
-            className="titlebar-btn"
+            className="tl-btn tl-min"
             onClick={() => win.minimize()}
             aria-label="Minimize"
             title="Minimize"
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10"><line x1="0" y1="5" x2="10" y2="5" stroke="currentColor" strokeWidth="1" /></svg>
-          </button>
+          />
           <button
-            className="titlebar-btn"
+            className="tl-btn tl-max"
             onClick={() => win.toggleMaximize()}
             aria-label="Maximize"
             title="Maximize"
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" strokeWidth="1" /></svg>
-          </button>
+          />
           <button
-            className="titlebar-btn titlebar-btn-close"
+            className="tl-btn tl-close"
             onClick={() => win.close()}
             aria-label="Close"
             title="Close"
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10"><line x1="0" y1="0" x2="10" y2="10" stroke="currentColor" strokeWidth="1" /><line x1="10" y1="0" x2="0" y2="10" stroke="currentColor" strokeWidth="1" /></svg>
-          </button>
+          />
         </div>
       </div>
       {usage && usage.used_pct >= 85 && (

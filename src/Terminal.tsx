@@ -7,28 +7,29 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
 
+// Tokyo Night palette — modern, calm, high readability.
 const THEME = {
-  background: "#0d1117",
-  foreground: "#e6edf3",
-  cursor: "#58a6ff",
-  cursorAccent: "#0d1117",
-  selectionBackground: "#264f78",
-  black: "#484f58",
-  red: "#ff7b72",
-  green: "#7ee787",
-  yellow: "#d29922",
-  blue: "#58a6ff",
-  magenta: "#bc8cff",
-  cyan: "#39c5cf",
-  white: "#e6edf3",
-  brightBlack: "#6e7681",
-  brightRed: "#ffa198",
-  brightGreen: "#56d364",
-  brightYellow: "#e3b341",
-  brightBlue: "#79c0ff",
-  brightMagenta: "#d2a8ff",
-  brightCyan: "#56d4dd",
-  brightWhite: "#f0f6fc",
+  background: "#14151c",
+  foreground: "#d4dbe8",
+  cursor: "#8aa2ff",
+  cursorAccent: "#14151c",
+  selectionBackground: "#36436b",
+  black: "#15161e",
+  red: "#f7768e",
+  green: "#9ece6a",
+  yellow: "#e0af68",
+  blue: "#7aa2f7",
+  magenta: "#bb9af7",
+  cyan: "#7dcfff",
+  white: "#a9b1d6",
+  brightBlack: "#414868",
+  brightRed: "#ff899d",
+  brightGreen: "#9fe044",
+  brightYellow: "#faba4a",
+  brightBlue: "#8ab1f8",
+  brightMagenta: "#c7a9ff",
+  brightCyan: "#a4daff",
+  brightWhite: "#c0caf5",
 };
 
 export default function Terminal() {
@@ -89,15 +90,27 @@ export default function Terminal() {
       STORED_SIZE >= 10 && STORED_SIZE <= 28 ? STORED_SIZE : 14;
 
     const term = new XTerm({
-      fontFamily: '"JetBrains Mono", "Cascadia Mono", Consolas, monospace',
+      fontFamily: '"IBM Plex Mono", "Geist Mono", "JetBrains Mono", Consolas, monospace',
       fontSize: initialFontSize,
-      lineHeight: 1.2,
+      lineHeight: 1.4,
+      letterSpacing: 0.3,
+      fontWeight: "400",
+      fontWeightBold: "500",
       cursorBlink: true,
       cursorStyle: "bar",
+      cursorInactiveStyle: "bar",
+      cursorWidth: 2,
       theme: THEME,
       scrollback: 10000,
       allowProposedApi: true,
+      smoothScrollDuration: 80,
     });
+
+    // Lock cursor to bar — Claude Code (Ink) sends DECSCUSR to switch to block.
+    // Re-assert our preference whenever cursor style changes.
+    setInterval(() => {
+      if (term.options.cursorStyle !== "bar") term.options.cursorStyle = "bar";
+    }, 1000);
     xtermRef.current = term;
 
     const fitAddon = new FitAddon();

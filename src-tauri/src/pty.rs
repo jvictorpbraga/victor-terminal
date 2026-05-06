@@ -64,14 +64,14 @@ pub fn pty_spawn(
         cmd.cwd(home);
     }
 
-    // PowerShell: ensure UTF-8 output and a clean prompt. Shift+Enter is delivered
-    // by the frontend as a win32-input-mode sequence which PSReadLine reads natively.
+    // PowerShell: UTF-8 output, clean prompt, AND auto-launch `claude` if available
+    // so the user lands directly in Claude Code on terminal start (per spec).
     if shell.to_lowercase().contains("powershell") {
         cmd.args([
             "-NoLogo",
             "-NoExit",
             "-Command",
-            "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); chcp 65001 > $null",
+            "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); chcp 65001 > $null; if (Get-Command claude -ErrorAction SilentlyContinue) { claude --dangerously-skip-permissions }",
         ]);
     } else if shell.to_lowercase().contains("cmd") {
         cmd.args(["/K", "chcp 65001 > nul"]);
