@@ -134,17 +134,15 @@ export default function Terminal() {
     };
     updateMode();
 
-    // TUI-mode "select" simulation: when Ctrl+A is pressed inside Claude Code, we
-    // visually highlight the input AND set a flag. The flag turns subsequent
-    // Backspace/typing/paste into `\x01\x0b` (claude's Ctrl+A + Ctrl+K = clear input)
-    // followed by the new content. Gives Word-doc-style replace inside Claude Code,
-    // even though Claude Code itself has no native selection model.
-    //
-    // We DON'T clear the flag on cursor movement — Claude Code re-renders constantly
-    // and moves the cursor; that would always race the user's next keystroke.
+    // TUI-mode "select" state. tuiInputSelected = armed; armedSelLen = number of
+    // visual cells the highlight covers (used to compute how many Backspaces to
+    // synthesize for clearing — Claude Code won't delete past the prompt boundary,
+    // so overshooting is safe).
     let tuiInputSelected = false;
+    let armedSelLen = 0;
     const clearTuiSel = () => {
       tuiInputSelected = false;
+      armedSelLen = 0;
       term.clearSelection();
     };
 
@@ -205,8 +203,11 @@ export default function Terminal() {
         const isKeyV = event.code === "KeyV" || key === "v";
         const isKeyX = event.code === "KeyX" || key === "x";
 
-        // \x15 (Ctrl+U) — verified clears Claude Code's input atomically.
-        const TUI_CLEAR = "\x15";
+        // \x0c (Ctrl+L) — Claude Code's "clear input buffer" command (atomic, works
+        // for both single-line and multi-line input). Sourced from the bundled SDK.
+        // Send \x15 too as belt-and-braces for older claude versions where Ctrl+L
+        // is "redraw" — \x15 clears at least the current line.
+        const TUI_CLEAR = "\x0c";
 
         // Ctrl+Shift+C → always copy (overrides anything else)
         if (ctrl && shift && isKeyC) {
@@ -225,40 +226,50 @@ export default function Terminal() {
           return true;
         }
 
+        // Helper: build a "clear input" sequence. For multi-line input we send N
+        // backspaces where N = visual cells highlighted by Ctrl+A. Claude Code won't
+        // backspace past the prompt boundary, so overshoot is harmless.
+        const clearSeqForLen = (len: number): string => {
+          if (len <= 0) return TUI_CLEAR;
+          // Move to end first so backspaces start from the very end of input.
+          return "\x05" + "\x7f".repeat(len + 8);
+        };
+
         // Paste shortcuts in TUI mode — manual clipboard read, never let xterm send
-        // \x16 (Claude Code interprets that as "paste image", not "paste text").
-        // If armed via Ctrl+A, prepend TUI_CLEAR to replace the existing input.
+        // \x16 (Claude Code interprets that as "paste image").
         const isPasteCombo =
           (ctrl && isKeyV) || (shift && event.key === "Insert");
         if (isPasteCombo) {
           const armed = tuiInputSelected;
-          if (armed) {
-            tuiInputSelected = false;
-            term.clearSelection();
-          }
-          navigator.clipboard.readText().then((text) => {
-            const data = (armed ? TUI_CLEAR : "") + (text ?? "");
+          const len = armedSelLen;
+          if (armed) clearTuiSel();
+          navigator.clipboard.readText().then((raw) => {
+            // Normalize line endings — claude treats \r and \n separately, so \r\n
+            // would create an extra blank line. Collapse to a single \n per break.
+            const text = (raw ?? "").replace(/\r\n?/g, "\n");
+            const prefix = armed ? clearSeqForLen(len) : "";
+            const data = prefix + text;
             if (data) invoke("pty_write", { data });
           }).catch(() => {
-            if (armed) invoke("pty_write", { data: TUI_CLEAR });
+            if (armed) invoke("pty_write", { data: clearSeqForLen(len) });
           });
           return false;
         }
 
-        // Ctrl+A — find Claude Code's input row by scanning the visible viewport
-        // for a row matching `> [content]` (Ink renders the prompt at a fixed UI
-        // location, but xterm's cursorY tracks the post-render save point which
-        // can be on a status line, not the input).
+        // Ctrl+A — find Claude Code's input range, possibly across multiple rows.
         if (ctrl && !shift && isKeyA) {
+          armedSelLen = 0; // reset; we'll set it again below if we find input
           const buf = term.buffer.active;
-          const viewTop = buf.viewportY;
-          const viewBottom = viewTop + term.rows - 1;
+          const viewTop = Math.max(0, buf.viewportY - 30); // also peek into scrollback
+          const viewBottom = buf.viewportY + term.rows - 1;
           const PROMPT_RE = /^(\s*)(>|❯|›|»)\s+(\S.*?)\s*$/;
+          // Match a "looks like a continuation" line: has at least one non-space
+          // char and isn't a box border / status line.
+          const isBorder = (s: string) => /[╰╭╮╯─━┘└]/.test(s);
 
-          let bestRow = -1;
-          let bestStartCol = -1;
-          let bestEndCol = -1;
-          // Scan bottom-up so we prefer the most recent (active) input.
+          let startRow = -1, startCol = -1;
+          let endRow = -1, endCol = -1;
+
           for (let r = viewBottom; r >= viewTop; r--) {
             const line = buf.getLine(r)?.translateToString(true) ?? "";
             const m = line.match(PROMPT_RE);
@@ -266,56 +277,62 @@ export default function Terminal() {
               const leadingWs = m[1].length;
               const marker = m[2];
               const afterMarker = line.indexOf(marker, leadingWs) + marker.length;
-              // First non-whitespace char after the marker = real input start.
               const tail = line.slice(afterMarker);
               const firstNs = tail.search(/\S/);
-              const inputStart = afterMarker + (firstNs >= 0 ? firstNs : 0);
-              const inputEnd = line.replace(/\s+$/, "").length;
-              if (inputEnd > inputStart) {
-                bestRow = r;
-                bestStartCol = inputStart;
-                bestEndCol = inputEnd;
-                break;
+              startRow = r;
+              startCol = afterMarker + (firstNs >= 0 ? firstNs : 0);
+              endRow = r;
+              endCol = line.replace(/\s+$/, "").length;
+              // Walk DOWN to find continuation rows.
+              for (let r2 = r + 1; r2 <= viewBottom; r2++) {
+                const l2 = buf.getLine(r2)?.translateToString(true) ?? "";
+                const trimmed = l2.replace(/\s+$/, "");
+                if (trimmed === "") break;
+                if (isBorder(trimmed)) break;
+                // Avoid matching the status line `Opus 4.7 | Victor` etc.
+                // Heuristic: status lines tend to live below an empty/border row,
+                // so the empty-line/border break above already handled them.
+                endRow = r2;
+                endCol = trimmed.length;
               }
+              break;
             }
           }
 
-          if (bestRow >= 0) {
-            term.select(bestStartCol, bestRow, bestEndCol - bestStartCol);
+          if (startRow >= 0 && endRow >= startRow) {
+            const cols = term.cols;
+            const len = endRow === startRow
+              ? endCol - startCol
+              : (cols - startCol) + (endRow - startRow - 1) * cols + endCol;
+            term.select(startCol, startRow, len);
+            armedSelLen = len;
           }
           tuiInputSelected = true;
           return false;
         }
 
-        // When armed, destructive keys send TUI_CLEAR before the new content.
+        // When armed, destructive keys send the calculated clear sequence first.
         if (tuiInputSelected) {
-          // Backspace/Delete → clear input
+          const armedLen = armedSelLen;
           if (event.key === "Backspace" || event.key === "Delete") {
-            tuiInputSelected = false;
-            term.clearSelection();
-            invoke("pty_write", { data: TUI_CLEAR });
+            clearTuiSel();
+            invoke("pty_write", { data: clearSeqForLen(armedLen) });
             return false;
           }
-          // Ctrl+X → copy selection (if any) then clear
           if (ctrl && !shift && isKeyX) {
             const sel = term.getSelection();
             if (sel) navigator.clipboard.writeText(sel).catch(() => {});
-            tuiInputSelected = false;
-            term.clearSelection();
-            invoke("pty_write", { data: TUI_CLEAR });
+            clearTuiSel();
+            invoke("pty_write", { data: clearSeqForLen(armedLen) });
             return false;
           }
-          // (Paste-while-armed is handled in the unified paste handler above.)
-          // Printable char → clear + that char (replace)
           if (event.key.length === 1 && !ctrl && !alt && !meta) {
-            tuiInputSelected = false;
-            term.clearSelection();
-            invoke("pty_write", { data: TUI_CLEAR + event.key });
+            clearTuiSel();
+            invoke("pty_write", { data: clearSeqForLen(armedLen) + event.key });
             return false;
           }
           // Anything else (arrows, Enter, Esc) — drop the armed state, pass through
-          tuiInputSelected = false;
-          term.clearSelection();
+          clearTuiSel();
         }
 
         // Shift+Enter → universal newline (Ctrl+J = \n) per Claude Code docs.
@@ -514,12 +531,18 @@ export default function Terminal() {
       if (inputRow === -1) return;
       if (clickAbsRow !== inputRow) return;
       const targetCol = Math.max(inputStart, Math.min(inputEnd, clickCol));
-      const movesLeft = inputEnd - targetCol;
-      if (movesLeft <= 0) return;
+      const distFromStart = targetCol - inputStart;
+      const distFromEnd = inputEnd - targetCol;
+      if (distFromStart === 0 && distFromEnd === 0) return;
 
-      // \x05 = End (endOfLine), then \x1b[D = Left arrow.
-      let seq = "\x05";
-      for (let i = 0; i < movesLeft; i++) seq += "\x1b[D";
+      // Pick whichever anchor (start vs end) needs fewer arrow keys — halves the
+      // worst-case render count claude has to do.
+      let seq: string;
+      if (distFromStart <= distFromEnd) {
+        seq = "\x01" + "\x1b[C".repeat(distFromStart); // BeginningOfLine + Right
+      } else {
+        seq = "\x05" + "\x1b[D".repeat(distFromEnd); // EndOfLine + Left
+      }
       invoke("pty_write", { data: seq });
       term.clearSelection();
       e.preventDefault();
