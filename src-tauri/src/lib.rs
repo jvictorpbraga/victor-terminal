@@ -1,4 +1,5 @@
 mod ledger;
+mod monitor;
 mod pty;
 
 use pty::PtyState;
@@ -10,6 +11,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             app.manage(PtyState::default());
+            monitor::spawn_monitor(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

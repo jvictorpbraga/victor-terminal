@@ -71,6 +71,63 @@ body,
   border-color: #58a6ff;
 }
 
+.usage-pill {
+  display: inline-block;
+  padding: 1px 8px;
+  font-size: 10px;
+  font-family: var(--font-mono, "Consolas", monospace);
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  background: #21262d;
+  color: #8b949e;
+  border-radius: 10px;
+  border: 1px solid #30363d;
+}
+
+.usage-pill.usage-warn {
+  background: #3a2a05;
+  color: #d29922;
+  border-color: #66480c;
+}
+
+.usage-pill.usage-danger {
+  background: #4a0e0c;
+  color: #ff7b72;
+  border-color: #aa1f1f;
+  animation: usage-pulse 2s ease-in-out infinite;
+}
+
+@keyframes usage-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
+.usage-banner {
+  flex: 0 0 auto;
+  padding: 6px 16px;
+  background: #3a2a05;
+  border-bottom: 1px solid #66480c;
+  color: #d29922;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.usage-banner.danger {
+  background: #4a0e0c;
+  border-bottom-color: #aa1f1f;
+  color: #ff7b72;
+}
+
+.usage-banner code {
+  font-family: var(--font-mono, "Consolas", monospace);
+  background: rgba(0, 0, 0, 0.3);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
 .titlebar-controls {
   display: flex;
   align-items: stretch;
