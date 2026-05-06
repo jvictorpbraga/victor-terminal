@@ -36,9 +36,9 @@ body,
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: space-between;
+  padding-left: 12px;
   user-select: none;
-  -webkit-app-region: drag;
 }
 
 .titlebar-title {
@@ -46,6 +46,59 @@ body,
   font-weight: 500;
   color: #8b949e;
   letter-spacing: 0.3px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mode-pill {
+  display: inline-block;
+  padding: 1px 7px;
+  font-size: 10px;
+  font-family: var(--font-mono, "Consolas", monospace);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  background: #21262d;
+  color: #6e7681;
+  border-radius: 10px;
+  border: 1px solid #30363d;
+}
+
+.mode-pill-tui {
+  background: #1f6feb;
+  color: white;
+  border-color: #58a6ff;
+}
+
+.titlebar-controls {
+  display: flex;
+  align-items: stretch;
+  height: 32px;
+  -webkit-app-region: no-drag;
+}
+
+.titlebar-btn {
+  width: 46px;
+  height: 100%;
+  border: none;
+  background: transparent;
+  color: #8b949e;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.1s, color 0.1s;
+}
+
+.titlebar-btn:hover {
+  background: #21262d;
+  color: var(--fg);
+}
+
+.titlebar-btn-close:hover {
+  background: #da3633;
+  color: white;
 }
 
 .terminal {
@@ -70,4 +123,68 @@ body,
 
 .xterm-viewport::-webkit-scrollbar-thumb:hover {
   background: #484f58;
+}
+
+/* Right-click context menu */
+.ctx-menu-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+}
+
+.ctx-menu {
+  position: fixed;
+  z-index: 101;
+  min-width: 200px;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  padding: 4px;
+  font-size: 13px;
+  user-select: none;
+}
+
+.ctx-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  padding: 7px 12px;
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  cursor: pointer;
+  border-radius: 5px;
+  font-family: inherit;
+  font-size: inherit;
+  text-align: left;
+  transition: background 0.08s;
+}
+
+.ctx-item:hover:not(:disabled) {
+  background: #1f6feb;
+  color: white;
+}
+
+.ctx-item:disabled {
+  color: #6e7681;
+  cursor: default;
+}
+
+.ctx-shortcut {
+  color: #8b949e;
+  font-size: 11px;
+  margin-left: 24px;
+  font-family: var(--font-mono, "Consolas", monospace);
+}
+
+.ctx-item:hover:not(:disabled) .ctx-shortcut {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.ctx-sep {
+  height: 1px;
+  background: #30363d;
+  margin: 4px 0;
 }

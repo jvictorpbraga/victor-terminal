@@ -64,7 +64,8 @@ pub fn pty_spawn(
         cmd.cwd(home);
     }
 
-    // PowerShell: ensure UTF-8 output and a clean prompt.
+    // PowerShell: ensure UTF-8 output and a clean prompt. Shift+Enter is delivered
+    // by the frontend as a win32-input-mode sequence which PSReadLine reads natively.
     if shell.to_lowercase().contains("powershell") {
         cmd.args([
             "-NoLogo",
