@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import Terminal from "./Terminal";
+import Ledger from "./Ledger";
 
 export default function App() {
   const win = getCurrentWindow();
   const [mode, setMode] = useState<string>("shell");
+  const [ledgerOpen, setLedgerOpen] = useState(false);
 
   useEffect(() => {
     const handler = (e: Event) => {
@@ -23,6 +25,13 @@ export default function App() {
           <span className={`mode-pill ${mode === "tui" ? "mode-pill-tui" : ""}`}>
             {mode}
           </span>
+          <button
+            className="titlebar-link"
+            onClick={() => setLedgerOpen((v) => !v)}
+            title="Open session ledger"
+          >
+            Ledger
+          </button>
         </span>
         <div className="titlebar-controls">
           <button
@@ -52,6 +61,7 @@ export default function App() {
         </div>
       </div>
       <Terminal />
+      <Ledger open={ledgerOpen} onClose={() => setLedgerOpen(false)} />
     </div>
   );
 }

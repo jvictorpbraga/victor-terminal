@@ -1,3 +1,4 @@
+mod ledger;
 mod pty;
 
 use pty::PtyState;
@@ -16,6 +17,9 @@ pub fn run() {
             pty::pty_write,
             pty::pty_resize,
             pty::pty_kill,
+            ledger::ledger_list_sessions,
+            ledger::ledger_get_session,
+            ledger::ledger_export_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
