@@ -83,9 +83,14 @@ export default function Terminal() {
     if (initializedRef.current) return;
     initializedRef.current = true;
 
+    // Persist font size in localStorage so it survives restarts.
+    const STORED_SIZE = Number(localStorage.getItem("ct:fontSize"));
+    const initialFontSize =
+      STORED_SIZE >= 10 && STORED_SIZE <= 28 ? STORED_SIZE : 14;
+
     const term = new XTerm({
       fontFamily: '"JetBrains Mono", "Cascadia Mono", Consolas, monospace',
-      fontSize: 14,
+      fontSize: initialFontSize,
       lineHeight: 1.2,
       cursorBlink: true,
       cursorStyle: "bar",
@@ -176,6 +181,14 @@ export default function Terminal() {
       return null;
     };
 
+    // Font zoom — works in both shell and TUI mode.
+    const setFontSize = (size: number) => {
+      const clamped = Math.max(10, Math.min(28, size));
+      term.options.fontSize = clamped;
+      localStorage.setItem("ct:fontSize", String(clamped));
+      fitAddon.fit();
+    };
+
     // Windows-Terminal-style keybindings — fixes the cmd.exe pain points.
     // Returning false from the handler prevents the key from being forwarded to the PTY.
     term.attachCustomKeyEventHandler((event) => {
@@ -186,6 +199,24 @@ export default function Terminal() {
         if (event.ctrlKey || event.altKey || event.metaKey) return false;
         if (event.shiftKey && event.key === "Enter") return false;
         return true;
+      }
+
+      // Font zoom: Ctrl+= / Ctrl++ (zoom in), Ctrl+- (zoom out), Ctrl+0 (reset).
+      // Works in both shell and TUI mode. Note: on US layouts, "+" is shift+= so
+      // we accept both the bare "=" with ctrl and the "=" code regardless of shift.
+      if (event.ctrlKey && !event.altKey && !event.metaKey) {
+        if (event.code === "Equal" || event.key === "+" || event.key === "=") {
+          setFontSize((term.options.fontSize ?? 14) + 1);
+          return false;
+        }
+        if (event.code === "Minus" || event.key === "-" || event.key === "_") {
+          setFontSize((term.options.fontSize ?? 14) - 1);
+          return false;
+        }
+        if (event.code === "Digit0" || event.key === "0") {
+          setFontSize(14);
+          return false;
+        }
       }
       const key = event.key.toLowerCase();
       const ctrl = event.ctrlKey;
