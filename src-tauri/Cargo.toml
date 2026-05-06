@@ -1,0 +1,32 @@
+[package]
+name = "claude-terminal"
+version = "0.1.0"
+description = "Modern minimal terminal with embedded Claude Code"
+authors = ["Victor"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "claude_terminal_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portable-pty = "0.8"
+tokio = { version = "1", features = ["full"] }
+parking_lot = "0.12"
+bytes = "1"
+anyhow = "1"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
