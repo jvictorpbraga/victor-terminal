@@ -1,4 +1,4 @@
-﻿node_modules/
+node_modules/
 dist/
 target/
 src-tauri/target/
@@ -8,4 +8,12 @@ src-tauri/gen/
 *.log
 .DS_Store
 Thumbs.db
-Cargo.lock
+
+# Local chat history — contains real conversation content, never commit
+sessions/
+
+# Built installers/binaries — kept locally, not in source
+for-friends/*.exe
+for-friends/*.msi
+*.exe
+*.msi

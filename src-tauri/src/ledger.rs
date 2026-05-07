@@ -202,6 +202,23 @@ pub fn ledger_get_session(
     render_markdown(&path)
 }
 
+/// Return the raw JSONL contents of a session — one JSON object per line.
+/// Used by the chat UI when resuming a past conversation: the frontend
+/// replays each line through the same event reducer it uses for the live
+/// claude-event stream.
+#[tauri::command]
+pub fn ledger_get_session_jsonl(
+    session_id: String,
+    cwd: Option<String>,
+) -> Result<String, String> {
+    let dir = pick_project_dir(cwd.as_deref())?;
+    let path = dir.join(format!("{}.jsonl", session_id));
+    if !path.exists() {
+        return Err(format!("Session not found: {}", path.display()));
+    }
+    fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
 fn render_markdown(path: &Path) -> Result<String, String> {
     let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut out = String::new();
@@ -351,6 +368,166 @@ fn render_markdown(path: &Path) -> Result<String, String> {
     }
 
     Ok(out)
+}
+
+#[derive(Serialize)]
+pub struct SearchHit {
+    pub id: String,
+    pub modified_unix: u64,
+    pub size: u64,
+    pub title: Option<String>,
+    pub first_user: Option<String>,
+    /// "title" | "first_user" | "content"
+    pub matched: String,
+    /// Short text excerpt where the query was found
+    pub snippet: Option<String>,
+}
+
+/// Search across all sessions in the cwd's project dir. Matches case-insensitively
+/// against title, first user message, and message content (one pass per file).
+#[tauri::command]
+pub fn ledger_search(
+    query: String,
+    cwd: Option<String>,
+) -> Result<Vec<SearchHit>, String> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dir = pick_project_dir(cwd.as_deref())?;
+    let mut hits: Vec<SearchHit> = Vec::new();
+
+    for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let meta = entry.metadata().map_err(|e| e.to_string())?;
+        let modified_unix = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let size = meta.len();
+        let (title, first_user) = peek_session_title(&path);
+
+        let title_match = title
+            .as_deref()
+            .map(|s| s.to_lowercase().contains(&q))
+            .unwrap_or(false);
+        let user_match = first_user
+            .as_deref()
+            .map(|s| s.to_lowercase().contains(&q))
+            .unwrap_or(false);
+
+        let (matched, snippet) = if title_match {
+            ("title".to_string(), title.clone())
+        } else if user_match {
+            ("first_user".to_string(), first_user.clone())
+        } else {
+            // Content scan — find the first line that contains the query and
+            // extract a readable snippet from any text fields it has.
+            match fs::read_to_string(&path) {
+                Ok(content) => {
+                    let mut found_snip: Option<String> = None;
+                    for line in content.lines() {
+                        if line.to_lowercase().contains(&q) {
+                            let v: Value = match serde_json::from_str(line) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            // Try to extract a clean text from this entry rather
+                            // than showing raw JSON to the user.
+                            let text = extract_searchable_text(&v);
+                            if let Some(t) = text {
+                                if t.to_lowercase().contains(&q) {
+                                    let trimmed: String = t.chars().take(140).collect();
+                                    let suffix = if t.chars().count() > 140 { "…" } else { "" };
+                                    found_snip = Some(format!("{}{}", trimmed, suffix));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(s) = found_snip {
+                        ("content".to_string(), Some(s))
+                    } else {
+                        continue;
+                    }
+                }
+                Err(_) => continue,
+            }
+        };
+
+        hits.push(SearchHit {
+            id,
+            modified_unix,
+            size,
+            title,
+            first_user,
+            matched,
+            snippet,
+        });
+    }
+
+    hits.sort_by(|a, b| b.modified_unix.cmp(&a.modified_unix));
+    Ok(hits)
+}
+
+/// Pull human-readable text out of a session JSONL entry. Used for search
+/// snippets — we don't want to surface raw JSON to the user.
+fn extract_searchable_text(v: &Value) -> Option<String> {
+    let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    if t == "ai-title" {
+        return v.get("title").and_then(|x| x.as_str()).map(|s| s.to_string());
+    }
+    let msg = v.get("message")?;
+    let content = msg.get("content")?;
+    if let Value::String(s) = content {
+        return Some(s.clone());
+    }
+    if let Value::Array(arr) = content {
+        let mut buf = String::new();
+        for b in arr {
+            let bt = b.get("type").and_then(|x| x.as_str()).unwrap_or("");
+            if bt == "text" {
+                if let Some(s) = b.get("text").and_then(|x| x.as_str()) {
+                    if !buf.is_empty() {
+                        buf.push(' ');
+                    }
+                    buf.push_str(s);
+                }
+            } else if bt == "tool_result" {
+                let s = match b.get("content") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Array(a)) => a
+                        .iter()
+                        .find_map(|c| c.get("text").and_then(|x| x.as_str()))
+                        .unwrap_or("")
+                        .to_string(),
+                    _ => String::new(),
+                };
+                if !s.is_empty() {
+                    if !buf.is_empty() {
+                        buf.push(' ');
+                    }
+                    buf.push_str(&s);
+                }
+            }
+        }
+        if buf.is_empty() {
+            return None;
+        }
+        return Some(buf);
+    }
+    None
 }
 
 #[tauri::command]

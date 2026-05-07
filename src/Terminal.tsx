@@ -2,14 +2,66 @@ import { useEffect, useRef, useState } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { WebglAddon } from "@xterm/addon-webgl";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
 
+// Pre-process PTY output before xterm consumes it, to expose xterm's real
+// bar cursor inside claude-code's input area.
+//
+// claude-code renders its visible cursor as `\x1b[30m\x1b[47m<char>\x1b[m` —
+// black foreground + WHITE background — i.e. `chalk.bgWhite.black(char)`,
+// painted on top of xterm's actual bar cursor. (Verified by hex-dumping
+// the live PTY stream: line `>·\x1b[30m\x1b[47mT\x1b[m ry "refactor..."`
+// from the placeholder render at startup.)
+// claude also sends `\x1b[?25l` (DECPM cursor hide) on init so the real
+// xterm cursor is invisible by default.
+//
+// We strip:
+//   - SGR 47 (basic bg white) — kills the white block highlight
+//   - SGR 7 / 27 (reverse on/off) — defense for inverse-video paths
+//   - `\x1b[?25l` (DECPM cursor hide) — keeps xterm's cursor drawable
+//
+// IMPORTANT: PTY chunks split on arbitrary byte boundaries, so a CSI
+// sequence can land split across two `pty-output` events. A stateless
+// regex would miss the split and xterm's stateful parser would still
+// apply the styling. We buffer any trailing partial escape across chunks.
+//
+// Side effect: any TUI app using basic SGR 47 background or SGR 7 reverse
+// (vim selection, less highlight) will lose those effects. Acceptable —
+// claude-code is the primary use case.
+let pendingEscape = "";
+function preprocessPtyChunk(chunk: string): string {
+  let s = pendingEscape + chunk;
+  pendingEscape = "";
+  // Hold back any trailing in-progress CSI sequence to next chunk.
+  let i = s.length - 1;
+  while (i >= 0 && /[\d;:?]/.test(s[i])) i--;
+  if (i >= 1 && s[i] === "[" && s[i - 1] === "\x1b") {
+    pendingEscape = s.slice(i - 1);
+    s = s.slice(0, i - 1);
+  } else if (s.length > 0 && s[s.length - 1] === "\x1b") {
+    pendingEscape = s.slice(-1);
+    s = s.slice(0, -1);
+  }
+  // Drop DECPM cursor-hide so xterm's real cursor stays visible.
+  s = s.replace(/\x1b\[\?25l/g, "");
+  // Filter SGR params 7, 27, 47 from `\x1b[...m` sequences.
+  return s.replace(/\x1b\[([\d;]*)m/g, (match, params: string) => {
+    if (!params) return match;
+    const parts = params.split(";");
+    const nums = parts.filter((n) => n !== "7" && n !== "27" && n !== "47");
+    if (nums.length === parts.length) return match;
+    if (nums.length === 0) return "";
+    return `\x1b[${nums.join(";")}m`;
+  });
+}
+
 // Tokyo Night palette — modern, calm, high readability.
+// background is transparent so the .app metallic gradient shines through the
+// xterm canvas. Combined with allowTransparency: true on the XTerm constructor.
 const THEME = {
-  background: "#14151c",
+  background: "rgba(0, 0, 0, 0)",
   foreground: "#d4dbe8",
   cursor: "#8aa2ff",
   cursorAccent: "#14151c",
@@ -103,14 +155,22 @@ export default function Terminal() {
       theme: THEME,
       scrollback: 10000,
       allowProposedApi: true,
+      allowTransparency: true,
       smoothScrollDuration: 80,
     });
 
-    // Lock cursor to bar — Claude Code (Ink) sends DECSCUSR to switch to block.
-    // Re-assert our preference whenever cursor style changes.
+    // Lock cursor to bar. Three layers of defense, because claude (Ink TUI) AND
+    // Windows ConPTY both send escape sequences that try to flip the cursor:
+    //   1. CSI parser handler swallows DECSCUSR (CSI Ps SP q) before xterm sees it.
+    //   2. setInterval re-asserts the option every 500ms — this is the only thing
+    //      that survived prior testing, because xterm's internal renderer state
+    //      can drift from the option without going through the parser.
+    //   3. cursorStyle: "bar" passed to the constructor handles the initial render.
+    term.parser.registerCsiHandler({ intermediates: " ", final: "q" }, () => true);
     setInterval(() => {
-      if (term.options.cursorStyle !== "bar") term.options.cursorStyle = "bar";
-    }, 1000);
+      term.options.cursorStyle = "bar";
+      term.options.cursorInactiveStyle = "bar";
+    }, 500);
     xtermRef.current = term;
 
     const fitAddon = new FitAddon();
@@ -118,13 +178,11 @@ export default function Terminal() {
     term.loadAddon(new WebLinksAddon());
 
     term.open(containerRef.current);
-
-    try {
-      term.loadAddon(new WebglAddon());
-    } catch {
-      // WebGL not available — fall back to canvas
-    }
-
+    // Using xterm's default DOM/canvas renderer (NOT WebGL).
+    // WebGL is faster but: (a) forces an opaque canvas which blocks the .app
+    // metallic gradient from showing through, and (b) doesn't reliably honor
+    // the `cursorStyle: "bar"` setting in some versions. The DOM renderer is
+    // plenty fast for terminal-scale workloads and respects transparency.
     fitAddon.fit();
 
     // Detect when a TUI / raw-mode app is in control (Claude Code, vim, htop, etc).
@@ -635,7 +693,7 @@ export default function Terminal() {
 
       // Receive PTY output
       unlistenOutput = await listen<string>("pty-output", (event) => {
-        const data = event.payload;
+        const data = preprocessPtyChunk(event.payload);
         term.write(data);
         // TUI detection: box-drawing chars latch the app into "tuiSticky" mode.
         // A shell prompt at the end of recent output unsticks it.
@@ -654,6 +712,14 @@ export default function Terminal() {
         term.write(`\r\n\x1b[33m[shell exited with code ${event.payload}]\x1b[0m\r\n`);
       });
 
+      // External components (App.tsx auto-resume) can ask us to write a marker.
+      const onExternalWrite = (e: Event) => {
+        const detail = (e as CustomEvent<string>).detail;
+        if (typeof detail === "string") term.write(detail);
+      };
+      window.addEventListener("ct:write", onExternalWrite);
+      (containerRef.current as any).__onExternalWrite = onExternalWrite;
+
       // Handle window resize
       const resizeObserver = new ResizeObserver(() => fitAddon.fit());
       resizeObserver.observe(containerRef.current!);
@@ -664,6 +730,8 @@ export default function Terminal() {
     return () => {
       unlistenOutput?.();
       unlistenExit?.();
+      const ext = (containerRef.current as any)?.__onExternalWrite;
+      if (ext) window.removeEventListener("ct:write", ext);
       containerRef.current?.removeEventListener("contextmenu", onContextMenu);
       containerRef.current?.removeEventListener("mousedown", onMouseDown, { capture: true } as any);
       containerRef.current?.removeEventListener("mouseup", onMouseUp, { capture: true } as any);

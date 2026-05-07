@@ -1,9 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
-import Terminal from "./Terminal";
-import Ledger from "./Ledger";
+import Chat from "./chat/Chat";
+import Sidebar from "./chat/Sidebar";
 
 type UsageSnapshot = {
   session_id: string;
@@ -16,47 +15,25 @@ type UsageSnapshot = {
 
 export default function App() {
   const win = getCurrentWindow();
-  const [mode, setMode] = useState<string>("shell");
-  const [ledgerOpen, setLedgerOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [usage, setUsage] = useState<UsageSnapshot | null>(null);
-  const [warned, setWarned] = useState(false);
-
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent<string>).detail;
-      if (typeof detail === "string") setMode(detail);
-    };
-    window.addEventListener("ct:mode", handler);
-    return () => window.removeEventListener("ct:mode", handler);
-  }, []);
+  const usageRef = useRef<UsageSnapshot | null>(null);
+  // resumeId drives Chat — change it (via key) to load a different session.
+  const [resumeId, setResumeId] = useState<string | null>(null);
+  // Bumping chatKey forces a fresh Chat mount even when resumeId is unchanged
+  // (e.g. user clicks "+ New chat" with no current resumeId).
+  const [chatKey, setChatKey] = useState(0);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     listen<UsageSnapshot>("session-usage", (event) => {
       setUsage(event.payload);
+      usageRef.current = event.payload;
     }).then((fn) => {
       unlisten = fn;
     });
     return () => unlisten?.();
   }, []);
-
-  // Auto-export ledger when context crosses 85%, only once per session.
-  useEffect(() => {
-    if (!usage) return;
-    if (usage.used_pct < 85) {
-      // Reset the warning when usage drops back down (e.g. after /compact)
-      if (warned && usage.used_pct < 50) setWarned(false);
-      return;
-    }
-    if (warned) return;
-    setWarned(true);
-    const out = `${navigator.userAgent.includes("Win") ? "C:\\Users\\Victor\\Desktop\\claude-terminal\\sessions\\" : ""}${usage.session_id}.md`;
-    invoke<string>("ledger_export_session", {
-      sessionId: usage.session_id,
-      cwd: null,
-      outPath: out,
-    }).catch(() => {});
-  }, [usage, warned]);
 
   const usagePctRounded = usage ? Math.min(100, Math.round(usage.used_pct)) : null;
   const usageColor =
@@ -68,16 +45,22 @@ export default function App() {
       ? "usage-warn"
       : "";
 
+  const onSelectSession = (id: string) => {
+    setResumeId(id);
+    setChatKey((k) => k + 1);
+  };
+
+  const onNewChat = () => {
+    setResumeId(null);
+    setChatKey((k) => k + 1);
+  };
+
   return (
     <div className="app">
       <div className="titlebar">
-        {/* Dedicated drag handle — fills the leftover space between content and buttons */}
         <div className="titlebar-drag" data-tauri-drag-region>
           <span className="titlebar-title">
-            <span>claude-terminal</span>
-            <span className={`mode-pill ${mode === "tui" ? "mode-pill-tui" : ""}`}>
-              {mode}
-            </span>
+            <span>Victor Terminal</span>
             {usagePctRounded != null && (
               <span
                 className={`usage-pill ${usageColor}`}
@@ -88,13 +71,6 @@ export default function App() {
             )}
           </span>
         </div>
-        <button
-          className="titlebar-link"
-          onClick={() => setLedgerOpen((v) => !v)}
-          title="Open session ledger"
-        >
-          Ledger
-        </button>
         <div className="traffic-lights">
           <button
             className="tl-btn tl-min"
@@ -116,17 +92,37 @@ export default function App() {
           />
         </div>
       </div>
-      {usage && usage.used_pct >= 85 && (
-        <div className={`usage-banner ${usage.used_pct >= 95 ? "danger" : ""}`}>
-          <span>
-            Context at <strong>{Math.round(usage.used_pct)}%</strong> · ledger saved
-            to <code>sessions/{usage.session_id}.md</code> · run{" "}
-            <code>/compact</code> in claude to summarize and continue.
-          </span>
-        </div>
-      )}
-      <Terminal />
-      <Ledger open={ledgerOpen} onClose={() => setLedgerOpen(false)} />
+      <button
+        className={`sidebar-rail ${sidebarOpen ? "open" : ""}`}
+        onClick={() => setSidebarOpen((v) => !v)}
+        aria-label={sidebarOpen ? "Close conversations" : "Open conversations"}
+        title={sidebarOpen ? "Close conversations" : "Conversations"}
+      >
+        <svg
+          className="sidebar-rail-chevron"
+          width="10"
+          height="14"
+          viewBox="0 0 10 14"
+          fill="none"
+        >
+          <path
+            d="M2 2 L7 7 L2 12"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      </button>
+      <Chat key={chatKey} resumeId={resumeId} />
+      <span className="signature">Victor Braga</span>
+      <Sidebar
+        open={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+        activeId={resumeId}
+        onSelectSession={onSelectSession}
+        onNewChat={onNewChat}
+      />
     </div>
   );
 }

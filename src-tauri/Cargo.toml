@@ -1,13 +1,13 @@
 [package]
-name = "claude-terminal"
+name = "victor-terminal"
 version = "0.1.0"
-description = "Modern minimal terminal with embedded Claude Code"
-authors = ["Victor"]
+description = "Victor Terminal — native Claude chat for Windows"
+authors = ["Victor Braga"]
 edition = "2021"
 rust-version = "1.77"
 
 [lib]
-name = "claude_terminal_lib"
+name = "victor_terminal_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

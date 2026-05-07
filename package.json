@@ -1,8 +1,8 @@
 {
-  "name": "claude-terminal",
+  "name": "victor-terminal",
   "version": "0.1.0",
   "private": true,
-  "description": "Modern minimal terminal with embedded Claude Code",
+  "description": "Victor Terminal — native Claude chat for Windows",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,14 +11,16 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@xterm/xterm": "^5.5.0",
+    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/plugin-shell": "^2.0.1",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-web-links": "^0.11.0",
     "@xterm/addon-webgl": "^0.18.0",
-    "@tauri-apps/api": "^2.1.1",
-    "@tauri-apps/plugin-shell": "^2.0.1",
+    "@xterm/xterm": "^5.5.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.1.0",

@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    claude_terminal_lib::run()
+    victor_terminal_lib::run()
 }

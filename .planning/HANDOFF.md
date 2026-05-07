@@ -26,9 +26,11 @@ Desktop shortcut at `C:\Users\Victor\Desktop\claude-terminal.lnk` (icon overridd
 | 0 — spec/scaffold | ✅ done | `.planning/SPEC.md`, `ROADMAP.md` |
 | 1 — Tauri shell + xterm | ✅ done | All editor shortcuts work in shell AND inside Claude Code |
 | 2 — Claude SDK sidecar | ⏭ skipped | Not needed — claude CLI runs directly inside our PowerShell |
-| 3 — Session Ledger panel | ✅ done | `src-tauri/src/ledger.rs` + `src/Ledger.tsx`. Reads `~/.claude/projects/<...>/*.jsonl`, renders as markdown. Auto-exports to `Desktop/claude-terminal/sessions/<id>.md` at 85% context. |
-| 4 — Live context monitor | ✅ done | `src-tauri/src/monitor.rs` polls active JSONL every 3s, emits `session-usage` event. Token pill in titlebar with color states. **NOT a true auto-resume — only a warning + manual `/compact` suggestion.** |
-| 5 — UI polish + installer | ⚠ in progress | Production .msi + NSIS built. UI iterated 6+ times. **Latest CSS+JSX changes uncommitted, in this session.** |
+| 3 — Session Ledger panel | ✅ done | `src-tauri/src/ledger.rs` + `src/Ledger.tsx`. Reads `~/.claude/projects/<...>/*.jsonl`, renders as markdown on demand. |
+| 4 — Live context monitor | ✅ done | `src-tauri/src/monitor.rs` polls active JSONL every 3s, emits `session-usage` event. Token pill in titlebar with color states. |
+| 5 — UI polish + installer | ✅ done (committed 657987f) | Recipe 1 metallic background, SVG grain overlay, IBM Plex / Geist Mono, sibling drag region (Tauri 2 + WebView2 fix). |
+| 6 — Continuous ledger writer | ⚠ pending verify | `src-tauri/src/ledger_watcher.rs` tails active JSONL every 3s, appends one-line markdown summaries to `Desktop/claude-terminal/sessions/<id>.md`. **Built this session, not yet runtime-tested.** |
+| 7 — Auto-resume in same tab | ⚠ pending verify | App.tsx polls usage every 2s; at ≥92% context AND ≥5s idle, sends Ctrl+C×2 to exit claude, then `claude --continue --append-system-prompt "..."` pointing the new claude at the ledger MD path. **Built this session, not yet runtime-tested.** |
 
 ---
 
@@ -126,59 +128,54 @@ In TUI mode, Ctrl+A doesn't truly highlight (claude redraws over it). We:
 
 ---
 
-## What's NOT yet built (the user's actual vision)
+## Step 2 + Step 3 — what was built this session
 
-These are the two features the user explicitly wanted but **scoped down** during the session:
+### Continuous ledger writer (Step 2) — `src-tauri/src/ledger_watcher.rs`
 
-### Continuous ledger writer (Step 2)
+A 3s-polling background thread spawned from `lib.rs setup()`. For the most-recent JSONL
+across all `~/.claude/projects/*/*.jsonl`:
+- First poll: writes a header to `Desktop/claude-terminal/sessions/<id>.md` and resets offset.
+- Subsequent polls: reads from `last_offset` to last newline, parses each new entry, appends
+  a one-line markdown summary per relevant entry, advances offset.
+- Skips stale sessions (>30 min idle).
 
-**Vision:** As claude works, a markdown file is being written to in real time describing
-every action ("Claude opened login.js", "Claude ran npm test", etc.). The user can open
-this file at any moment and see a human-readable narrative.
+Markdown format examples:
+- `` `[14:32:15]` **user** — fix the auth bug ``
+- `` `[14:32:18]` 🔧 `Bash` → `npm test` ``
+- `` `[14:32:21]` 🔧 `Edit` → .../src/login.js ``
+- `` `[14:32:30]` **claude** — Found the issue. Updating handler... ``
+- `  ↳ ✓ tool result summary`
 
-**What exists:** Lazy generation via `ledger_get_session` Tauri command — reads JSONL
-on demand. Auto-export to disk only at 85% context threshold.
+System reminders, IDE selection, and prompt-injection-shaped strings are filtered out so
+the narrative stays readable.
 
-**What's missing:** A file-watcher in Rust that polls/watches the active JSONL every
-2-3s and *appends* to a running `Desktop/claude-terminal/sessions/<id>.md` so it's always
-up to date (like a tail -f log).
+Note: this file overwrites the on-demand snapshot from `ledger_export_session` if both
+ever target the same path — but the 85%-threshold export call was removed from App.tsx
+(continuous writer makes it redundant). The export Tauri command still exists for ad-hoc
+use from `Ledger.tsx`.
 
-**How to build:**
-1. New `src-tauri/src/ledger_watcher.rs`. Reuse `monitor.rs`'s `find_active_session()`.
-2. Track `last_byte_offset` per session. Each poll, read the file from that offset,
-   parse the new lines, append a one-line markdown summary to the running MD file.
-3. Markdown format: `[HH:MM:SS] 🔧 Bash → "npm test" → exit 0`,
-   `[HH:MM:SS] 💬 user: "fix the auth bug"`,
-   `[HH:MM:SS] ✏ Edit login.js`, etc.
-4. Spawn from `lib.rs setup()` like `monitor.rs` already is.
-5. Estimated 150 LOC.
+### Auto-resume in same tab (Step 3) — modifications to `src/App.tsx` + `src/Terminal.tsx`
 
-### Auto-resume in same tab (Step 3)
+App.tsx — every 2s checks: usage ≥ 92% AND last `session-usage` event > 5s ago AND not
+yet resumed for this session_id. If trigger fires:
 
-**Vision:** When claude session approaches context limit (~95%), the app: (a) saves the
-final ledger, (b) sends `\x04` (Ctrl+D) twice to gracefully exit current claude, (c)
-runs `claude --continue --append-system-prompt "$(cat ledger.md)"` in the same PowerShell,
-(d) the new claude continues with the ledger as background context. User sees a brief
-`↻ resumed` marker, no work lost.
+1. Dispatch `ct:write` custom event so Terminal.tsx writes a cyan `↻ session at NN% — auto-resuming…` line into the xterm display.
+2. `pty_write("\x03")` — first Ctrl+C (interrupt any claude operation in flight).
+3. Wait 250ms.
+4. `pty_write("\x03")` — second Ctrl+C (claude exits cleanly back to PowerShell).
+5. Wait 1500ms for PowerShell prompt to redraw.
+6. `pty_write("claude --continue --dangerously-skip-permissions --append-system-prompt \"<note>\"\r")`.
 
-**What exists:** Token monitor + warning banner + auto-export of ledger. **No restart.**
+The `<note>` does NOT inline the full ledger (Windows 32K command-line limit). Instead it
+points the new claude at `Desktop/claude-terminal/sessions/<id>.md` and tells it to Read
+the file if it needs historical context. This is the practical workaround for the Windows
+arg length limit while still giving the new claude session full continuity.
 
-**What's missing:** The actual exit-and-restart sequence. Hard parts:
-- Detecting when claude is "idle" (no streaming response) so we can interrupt without
-  losing a half-rendered answer.
-- Sending the kill signal cleanly.
-- Reading the ledger MD content and embedding it into the next `--append-system-prompt`
-  flag (Windows command-line length limits — 32K chars — might force us to write to a
-  temp file and use `--append-system-prompt-file` if that flag exists, else inline up
-  to ~30K).
+`resumedRef` (Set) prevents a re-fire — one auto-resume per session_id, regardless of
+how many times the threshold is crossed.
 
-**How to build:**
-1. Frontend listens to `session-usage` event. At ~92% AND `last_idle_for > 5s`,
-   send via `pty_write`: `\r` (cancel any running claude operation), wait, then
-   `\x04` (exit claude), wait 1s for PowerShell prompt to come back, then send
-   `claude --continue --append-system-prompt-file "%USERPROFILE%\Desktop\claude-terminal\sessions\<id>.md"\r`.
-2. Add an inline marker in xterm via `term.write("\r\n\x1b[36m↻ session resumed with ledger context\x1b[0m\r\n")`.
-3. Estimated ~80 LOC (mostly frontend).
+Terminal.tsx now listens for the `ct:write` window event and pipes the string into
+`term.write(...)` so external components can inject UI markers.
 
 ---
 
@@ -230,11 +227,22 @@ Desktop/claude-terminal/
 
 ## TL;DR for next session
 
-1. Pull the build that's running right now into the installed app (or rebuild fresh).
-2. Test: drag the window from titlebar empty space, click min/max/close, verify metallic
-   shine looks smooth across the whole screen.
-3. If UI is good → start **Step 2: continuous ledger writer** (`ledger_watcher.rs`).
-4. Then **Step 3: auto-resume** (the actual differentiator the user wants).
+Phases 0–7 are all coded. The build kicked off at the end of the 2026-05-07 second session
+to bundle Steps 2+3 into the installer. **What's left is runtime verification:**
+
+1. Confirm the new installer at `Desktop/claude/claude-terminal-installers/` has been run.
+2. Open the app — claude should auto-launch as before.
+3. Have a real claude conversation. While it runs, open
+   `Desktop/claude-terminal/sessions/<your-session-id>.md` in a separate viewer and
+   confirm new lines are being appended every few seconds.
+4. Push usage close to 92% (or temporarily lower `RESUME_THRESHOLD_PCT` in App.tsx for
+   testing). After 5s idle, watch for the cyan `↻ session at …%` marker, claude exiting,
+   and a fresh `claude --continue --append-system-prompt "…"` line being typed automatically.
+5. The new claude session should be able to `Read` the ledger MD file when it needs
+   historical context.
+
+If Ctrl+C × 2 doesn't cleanly exit claude on the user's setup, swap to `\x04` (Ctrl+D)
+or send `/exit\r` instead — it's a one-line change in App.tsx.
 
 If anything in the UI still looks off, re-read `.planning/DESIGN-RESEARCH.md` Section A
 recipes — that's the authoritative source. Don't iterate without re-reading it.
