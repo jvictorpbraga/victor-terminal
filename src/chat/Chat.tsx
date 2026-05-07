@@ -33,11 +33,16 @@ export default function Chat({ resumeId }: ChatProps) {
   const [refreshNotice, setRefreshNotice] = useState<string | null>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
   const scrollerRef = useRef<HTMLDivElement>(null);
+  const chatListRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const lastUsageRef = useRef<UsageEvent | null>(null);
   const lastEventAtRef = useRef<number>(0);
   const restartedSessionsRef = useRef<Set<string>>(new Set());
   const modelRef = useRef(model);
+  // Tracks the bubble we're appending to for the current user turn. Reset on
+  // user send and on `result`. While set, all assistant content (text, tool
+  // calls, thinking, mid-turn round-trips) lands in ONE visible bubble.
+  const currentTurnIdRef = useRef<string | null>(null);
   useEffect(() => {
     modelRef.current = model;
   }, [model]);
@@ -173,7 +178,10 @@ export default function Chat({ resumeId }: ChatProps) {
     listen<string>("claude-event", (event) => {
       try {
         const obj = JSON.parse(event.payload);
-        applyEvent(obj, setAndRefMessages, () => setBusy(false));
+        applyEvent(obj, currentTurnIdRef, setAndRefMessages, () => {
+          setBusy(false);
+          currentTurnIdRef.current = null;
+        });
         lastEventAtRef.current = Date.now();
       } catch (e) {
         // ignore parse errors
@@ -189,12 +197,23 @@ export default function Chat({ resumeId }: ChatProps) {
     };
   }, [setAndRefMessages]);
 
-  // Auto-scroll to bottom on new content unless user has scrolled up.
+  // Auto-scroll to bottom on every content size change. Using a ResizeObserver
+  // on the inner chat-list catches every streaming delta — useEffect on the
+  // messages array fires before layout completes, so scrollHeight reads stale.
   useEffect(() => {
-    if (!stickToBottomRef.current) return;
-    const el = scrollerRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [messages]);
+    const scroller = scrollerRef.current;
+    const list = chatListRef.current;
+    if (!scroller || !list) return;
+    const ro = new ResizeObserver(() => {
+      if (stickToBottomRef.current) {
+        scroller.scrollTop = scroller.scrollHeight;
+      }
+    });
+    ro.observe(list);
+    // Also scroll immediately on initial mount in case content already overflows.
+    if (stickToBottomRef.current) scroller.scrollTop = scroller.scrollHeight;
+    return () => ro.disconnect();
+  }, []);
 
   const onScroll = () => {
     const el = scrollerRef.current;
@@ -215,6 +234,7 @@ export default function Chat({ resumeId }: ChatProps) {
     setAndRefMessages((prev) => [...prev, userMsg]);
     stickToBottomRef.current = true;
     setBusy(true);
+    currentTurnIdRef.current = null;
 
     // Build the SDK message content. If there are attachments, use the array
     // form with explicit content blocks (text + images). If no attachments,
@@ -262,7 +282,7 @@ export default function Chat({ resumeId }: ChatProps) {
     <div className="chat">
       <div className="chat-scroller" ref={scrollerRef} onScroll={onScroll}>
         {isEmpty && !busy && <Welcome />}
-        <div className="chat-list">
+        <div className="chat-list" ref={chatListRef}>
           {messages.map((m) => (
             <Message key={m.id} message={m} />
           ))}
@@ -305,99 +325,129 @@ export default function Chat({ resumeId }: ChatProps) {
 // --- Event reducer ----------------------------------------------------------
 //
 // claude --output-format=stream-json --include-partial-messages emits a mix of
-// SDK system events ({"type":"system",...}), assistant messages with full or
-// partial content, user-role events with tool_result blocks, and a final
-// {"type":"result",...} event marking the end of the turn.
+// SDK system events, assistant messages (full or partial), user-role events
+// with tool_result blocks, and a final result event marking the turn end.
+//
+// We collapse ALL assistant content of a single turn — text + tool_use +
+// thinking, including tool-call round-trips — into one visible bubble. The
+// `turnRef` holds the id of that bubble. It's null between turns; the first
+// assistant content after a user message creates the bubble, and `result`
+// (or the parent calling onSend) clears it.
+
+type SetMessages = (updater: (prev: ChatMessage[]) => ChatMessage[]) => void;
+type TurnRef = React.MutableRefObject<string | null>;
 
 function applyEvent(
   obj: any,
-  set: (updater: (prev: ChatMessage[]) => ChatMessage[]) => void,
+  turnRef: TurnRef,
+  set: SetMessages,
   markIdle: () => void,
 ) {
   const t = obj?.type;
 
   if (t === "result") {
-    // Turn complete.
     set((prev) =>
       prev.map((m) => (m.streaming ? { ...m, streaming: false } : m))
     );
+    turnRef.current = null;
     markIdle();
     return;
   }
 
-  if (t === "system") {
-    // init / setup info — ignore for v1.
-    return;
-  }
+  if (t === "system") return;
 
   if (t === "stream_event") {
-    // Partial message stream events (when --include-partial-messages is set).
-    handleStreamEvent(obj.event || obj, set);
+    handleStreamEvent(obj.event || obj, turnRef, set);
     return;
   }
 
   if (t === "assistant") {
-    // Full assistant message arrived (also delivered after streaming completes).
-    handleAssistantMessage(obj.message, set);
+    handleAssistantMessage(obj.message, turnRef, set);
     return;
   }
 
   if (t === "user") {
-    // User turn from the SDK perspective — usually a tool_result for the last
-    // tool_use we rendered. Match by tool_use_id.
     handleUserToolResult(obj.message, set);
     return;
   }
 }
 
+/** Ensure a turn bubble exists, return its id. */
+function ensureTurnBubble(
+  turnRef: TurnRef,
+  set: SetMessages,
+): string {
+  if (turnRef.current) return turnRef.current;
+  const id = `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  turnRef.current = id;
+  const msg: ChatMessage = {
+    id,
+    role: "assistant",
+    blocks: [],
+    timestamp: Date.now(),
+    streaming: true,
+  };
+  set((prev) => [...prev, msg]);
+  return id;
+}
+
+/** Apply an updater function to the current turn bubble in messages. */
+function updateTurnBubble(
+  turnRef: TurnRef,
+  set: SetMessages,
+  fn: (m: ChatMessage) => ChatMessage,
+) {
+  const id = turnRef.current;
+  if (!id) return;
+  set((prev) => {
+    const idx = prev.findIndex((m) => m.id === id);
+    if (idx < 0) return prev;
+    const next = prev.slice();
+    next[idx] = fn(prev[idx]);
+    return next;
+  });
+}
+
 function handleStreamEvent(
   ev: any,
-  set: (updater: (prev: ChatMessage[]) => ChatMessage[]) => void,
+  turnRef: TurnRef,
+  set: SetMessages,
 ) {
   const t = ev?.type;
   if (t === "message_start") {
-    const id = `a-${ev.message?.id || Date.now()}`;
-    const msg: ChatMessage = {
-      id,
-      role: "assistant",
-      blocks: [],
-      timestamp: Date.now(),
-      streaming: true,
-    };
-    set((prev) => [...prev, msg]);
+    // First message of a turn creates the bubble; subsequent message_starts
+    // (when claude does multi-turn tool round-trips inside one user turn) are
+    // ignored — we keep appending to the same bubble.
+    ensureTurnBubble(turnRef, set);
     return;
   }
   if (t === "content_block_start") {
     const block = ev.content_block;
-    set((prev) => {
-      const last = prev[prev.length - 1];
-      if (!last || last.role !== "assistant") return prev;
-      const newBlock = blockFromContentBlockStart(block);
-      if (!newBlock) return prev;
-      return replaceLast(prev, { ...last, blocks: [...last.blocks, newBlock] });
-    });
+    const newBlock = blockFromContentBlockStart(block);
+    if (!newBlock) return;
+    ensureTurnBubble(turnRef, set);
+    updateTurnBubble(turnRef, set, (m) => ({
+      ...m,
+      blocks: [...m.blocks, newBlock],
+    }));
     return;
   }
   if (t === "content_block_delta") {
     const delta = ev.delta;
-    set((prev) => {
-      const last = prev[prev.length - 1];
-      if (!last || last.role !== "assistant" || last.blocks.length === 0) return prev;
-      const blocks = [...last.blocks];
+    updateTurnBubble(turnRef, set, (m) => {
+      if (m.blocks.length === 0) return m;
+      const blocks = m.blocks.slice();
       const idx = blocks.length - 1;
-      const cur = blocks[idx];
-      blocks[idx] = applyDelta(cur, delta);
-      return replaceLast(prev, { ...last, blocks });
+      blocks[idx] = applyDelta(blocks[idx], delta);
+      return { ...m, blocks };
     });
     return;
   }
-  if (t === "content_block_stop") {
-    return; // nothing — block already in place
-  }
+  if (t === "content_block_stop") return;
   if (t === "message_stop") {
-    set((prev) =>
-      prev.map((m) => (m.streaming ? { ...m, streaming: false } : m))
-    );
+    // A single round-trip ended; the TURN may continue with another assistant
+    // message_start if claude is calling more tools. Don't clear the bubble
+    // or streaming flag here — that happens on `result`.
     return;
   }
 }
@@ -440,7 +490,8 @@ function applyDelta(block: ContentBlock, delta: any): ContentBlock {
 
 function handleAssistantMessage(
   message: any,
-  set: (updater: (prev: ChatMessage[]) => ChatMessage[]) => void,
+  turnRef: TurnRef,
+  set: SetMessages,
 ) {
   if (!message) return;
   const blocks: ContentBlock[] = [];
@@ -456,17 +507,44 @@ function handleAssistantMessage(
   }
   if (blocks.length === 0) return;
 
-  set((prev) => {
-    const last = prev[prev.length - 1];
-    if (last && last.role === "assistant" && last.streaming) {
-      // Replace the streaming placeholder with the final content.
-      return replaceLast(prev, { ...last, blocks, streaming: false });
-    }
+  // Full assistant message arrival. If there's already a streaming bubble for
+  // this turn (built up from content_block_delta events), replace its blocks
+  // with the canonical full version. If there's no bubble yet, create it.
+  // If the bubble exists and already has tool_use blocks from an earlier
+  // round-trip, APPEND these new blocks instead of replacing — this is the
+  // multi-tool round-trip case where claude sends a new full message after
+  // each tool result.
+  if (!turnRef.current) {
     const id = `a-${message.id || Date.now()}`;
-    return [
+    turnRef.current = id;
+    set((prev) => [
       ...prev,
-      { id, role: "assistant", blocks, timestamp: Date.now(), streaming: false },
-    ];
+      { id, role: "assistant", blocks, timestamp: Date.now(), streaming: true },
+    ]);
+    return;
+  }
+  set((prev) => {
+    const idx = prev.findIndex((m) => m.id === turnRef.current);
+    if (idx < 0) {
+      // Bubble vanished somehow — recreate.
+      return [
+        ...prev,
+        { id: turnRef.current!, role: "assistant", blocks, timestamp: Date.now(), streaming: true },
+      ];
+    }
+    const cur = prev[idx];
+    // If existing bubble has only streaming-built deltas matching this content
+    // (same number of blocks and same kinds), the full message is just the
+    // canonical version of the same content — REPLACE.
+    // Otherwise APPEND (multi-round-trip case).
+    const isSameAsCanonical =
+      cur.blocks.length > 0 &&
+      cur.blocks.length === blocks.length &&
+      cur.blocks.every((b, i) => b.kind === blocks[i].kind);
+    const merged = isSameAsCanonical ? blocks : [...cur.blocks, ...blocks];
+    const next = prev.slice();
+    next[idx] = { ...cur, blocks: merged, streaming: true };
+    return next;
   });
 }
 
@@ -522,81 +600,61 @@ function attachToolResult(
   return prev;
 }
 
-function replaceLast(arr: ChatMessage[], item: ChatMessage): ChatMessage[] {
-  const next = arr.slice(0, -1);
-  next.push(item);
-  return next;
-}
 
-// Replay a session's stored JSONL into our message tree. Each line is one of
-// the same event shapes we receive live from claude-event, so we can reuse
-// the same reducer and end up with the same chat state.
+// Replay a session's stored JSONL into our message tree. Same merge rule as
+// the live path: every assistant content between two user messages collapses
+// into ONE bubble (so multi-tool round-trips don't show up as N bubbles).
 export function replayJsonl(jsonl: string): ChatMessage[] {
   let messages: ChatMessage[] = [];
-  const set = (updater: (prev: ChatMessage[]) => ChatMessage[]) => {
+  const set: SetMessages = (updater) => {
     messages = updater(messages);
   };
+  const turnRef = { current: null as string | null } as TurnRef;
   for (const line of jsonl.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
+    let obj: any;
     try {
-      const obj = JSON.parse(trimmed);
-      // Support both the live stream-json shapes and the persistent JSONL shape.
-      // The persistent JSONL omits stream_event entries — it stores the FULL
-      // assistant message and user-tool_result messages directly.
-      if (obj.type === "user" || obj.type === "assistant") {
-        // Persistent JSONL also includes a `message` envelope with content[].
-        // applyEvent handles this fine for full assistant messages and for
-        // user messages with tool_result blocks. For plain user text, we
-        // need a small adapter because applyEvent doesn't add a user bubble
-        // (it expects user messages to come from THIS app, not the JSONL).
-        if (obj.type === "user") {
-          const msg = obj.message;
-          if (msg?.content && typeof msg.content === "string") {
-            // Plain user text — push as a user message.
-            const userMsg: ChatMessage = {
-              id: `r-u-${messages.length}`,
-              role: "user",
-              blocks: [{ kind: "text", text: msg.content }],
-              timestamp: 0,
-            };
-            messages = [...messages, userMsg];
-            continue;
-          }
-          if (Array.isArray(msg?.content)) {
-            // Could be tool_result OR plain text content. Handle both.
-            const textBlock = msg.content.find(
-              (c: any) => c.type === "text" && typeof c.text === "string",
-            );
-            const hasToolResult = msg.content.some(
-              (c: any) => c.type === "tool_result",
-            );
-            if (hasToolResult) {
-              applyEvent(obj, set, () => {});
-              continue;
-            }
-            if (textBlock) {
-              const userMsg: ChatMessage = {
-                id: `r-u-${messages.length}`,
-                role: "user",
-                blocks: [{ kind: "text", text: textBlock.text }],
-                timestamp: 0,
-              };
-              messages = [...messages, userMsg];
-              continue;
-            }
-          }
-          continue;
-        }
-        // Assistant
-        applyEvent(obj, set, () => {});
+      obj = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (obj.type === "user") {
+      const msg = obj.message;
+      const isToolResult =
+        Array.isArray(msg?.content) &&
+        msg.content.some((c: any) => c.type === "tool_result");
+      if (isToolResult) {
+        // Mid-turn — don't reset the bubble; just attach the tool result.
+        handleUserToolResult(msg, set);
         continue;
       }
-      // Other event types (system, ai-title, summary, etc.) — ignore for replay.
-    } catch {
-      // skip non-JSON / corrupt lines
+      // Plain user text — push a user bubble and reset the turn so the next
+      // assistant content opens a fresh bubble.
+      let text: string | null = null;
+      if (typeof msg?.content === "string") text = msg.content;
+      else if (Array.isArray(msg?.content)) {
+        const tb = msg.content.find(
+          (c: any) => c.type === "text" && typeof c.text === "string",
+        );
+        if (tb) text = tb.text;
+      }
+      if (text) {
+        const userMsg: ChatMessage = {
+          id: `r-u-${messages.length}`,
+          role: "user",
+          blocks: [{ kind: "text", text }],
+          timestamp: 0,
+        };
+        messages = [...messages, userMsg];
+      }
+      turnRef.current = null;
+      continue;
     }
+    if (obj.type === "assistant") {
+      handleAssistantMessage(obj.message, turnRef, set);
+    }
+    // Ignore system / ai-title / summary / etc.
   }
-  // Mark all as not streaming.
   return messages.map((m) => ({ ...m, streaming: false }));
 }

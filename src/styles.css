@@ -34,6 +34,40 @@ body,
   text-rendering: optimizeLegibility;
 }
 
+/* Dark, slim scrollbars that match the metallic UI. Applies everywhere
+   that scrolls: chat surface, sidebar list, tool-call bodies, model and
+   language dropdowns. Firefox uses `scrollbar-color`. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(140, 160, 200, 0.22) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(140, 160, 200, 0.22);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  transition: background 0.15s;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(160, 185, 230, 0.45);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
 /* Modern futuristic minimalist base — single dramatic light source from
    top-center, deep navy fall-off into the corners, top-edge highlight rim.
    Inspired by Cursor / Linear / Apple Vision Pro UI: clean gradients, no
