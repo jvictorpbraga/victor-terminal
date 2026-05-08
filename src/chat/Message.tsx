@@ -45,6 +45,19 @@ export default function Message({ message }: Props) {
         )}
       </div>
       <div className="msg-body">
+        {/* When the assistant bubble has been opened (message_start arrived)
+            but no content has streamed yet, show the thinking dots inline so
+            the user sees the chat is still working — covers the slow-API-call
+            window where the bubble would otherwise look frozen. */}
+        {message.role === "assistant" &&
+          message.streaming &&
+          isEffectivelyEmpty(message.blocks) && (
+            <span className="thinking-dots" aria-label="Claude is working">
+              <span></span>
+              <span></span>
+              <span></span>
+            </span>
+          )}
         {message.blocks.map((b, i) => {
           if (b.kind === "text") {
             return (
@@ -473,4 +486,18 @@ function shortPath(p: string): string {
   const parts = p.split(/[\\/]/);
   if (parts.length <= 3) return p;
   return ".../" + parts.slice(-2).join("/");
+}
+
+/** True when no block has any visible content yet (empty text, empty
+ *  thinking, no tool_use blocks). Used to keep the thinking-dots spinner
+ *  visible while a streaming bubble has been opened but is still empty. */
+function isEffectivelyEmpty(
+  blocks: { kind: string; text?: string }[],
+): boolean {
+  if (blocks.length === 0) return true;
+  return blocks.every(
+    (b) =>
+      (b.kind === "text" && (!b.text || b.text.length === 0)) ||
+      (b.kind === "thinking" && (!b.text || b.text.length === 0)),
+  );
 }

@@ -23,6 +23,10 @@ type Props = {
   onChangeModel: (slug: string) => void;
   onSend: (text: string, attachments: Attachment[]) => void;
   onInterrupt: () => void;
+  /** Fired the first time the user types into the prompt bar. Used to
+   *  pre-warm the claude subprocess so the cold-start latency is hidden
+   *  under the typing time instead of stacking onto the send. */
+  onIntent?: () => void;
 };
 
 export default function PromptBar({
@@ -31,9 +35,11 @@ export default function PromptBar({
   onChangeModel,
   onSend,
   onInterrupt,
+  onIntent,
 }: Props) {
   const disabled = false;
   const [text, setText] = useState("");
+  const intentFiredRef = useRef(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [showModels, setShowModels] = useState(false);
   const [listening, setListening] = useState(false);
@@ -281,7 +287,13 @@ export default function PromptBar({
               : "Message Victor Terminal…"
           }
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            setText(e.target.value);
+            if (!intentFiredRef.current && e.target.value.length > 0) {
+              intentFiredRef.current = true;
+              onIntent?.();
+            }
+          }}
           onKeyDown={onKey}
           onPaste={onPaste}
           rows={1}

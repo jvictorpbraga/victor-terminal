@@ -640,6 +640,12 @@ export default function App() {
               }
               onMinimize={() => minimizeChat(session.key)}
               onFocusOnly={() => focusOnly(session.key)}
+              onIntent={() => {
+                // Pre-warm: spawn claude as soon as the user starts typing so
+                // the cold-start latency hides under the typing time. Fires
+                // at most once per chat (PromptBar guards intentFiredRef).
+                ensureClaudeSpawned(session.key).catch(() => {});
+              }}
             />
           ))
         )}

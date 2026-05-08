@@ -21,6 +21,8 @@ type Props = {
   onDismissError: () => void;
   onMinimize?: () => void;
   onFocusOnly?: () => void;
+  /** Fires when the user starts typing — used to pre-warm claude. */
+  onIntent?: () => void;
 };
 
 export default function Chat({
@@ -33,6 +35,7 @@ export default function Chat({
   onDismissError,
   onMinimize,
   onFocusOnly,
+  onIntent,
 }: Props) {
   const scrollerRef = useRef<HTMLDivElement>(null);
   const chatListRef = useRef<HTMLDivElement>(null);
@@ -174,6 +177,7 @@ export default function Chat({
         onChangeModel={onChangeModel}
         onSend={handleSend}
         onInterrupt={onInterrupt}
+        onIntent={onIntent}
       />
     </div>
   );
