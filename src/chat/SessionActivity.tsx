@@ -34,33 +34,25 @@ const MAX_CHIPS = 3;                   // cap to avoid screen spam
 export default function SessionActivity({ session }: { session: SessionData }) {
   const [now, setNow] = useState(Date.now());
 
-  // Only tick the clock when claude has actually gone silent — this keeps the
-  // activity strip dormant during normal streaming and avoids re-rendering
-  // every 500ms when there's nothing to show.
   const idleMs =
     session.lastEventAt > 0 ? Date.now() - session.lastEventAt : 0;
-  const silentEnough = session.busy && idleMs > SILENCE_MS;
-  useEffect(() => {
-    if (!silentEnough) return;
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [silentEnough]);
 
-  // Bail before we walk messages — when claude is mid-stream the strip stays
-  // hidden entirely, regardless of pending bg-tasks/wakeups.
-  if (!silentEnough) return null;
-
+  // The "working" pulse is the chat-is-stuck-or-thinking indicator — gated on
+  // busy + silent. Bg-tasks and wakeups are different: they signal "claude has
+  // returned its turn but a background process is still running" and need to
+  // render even when busy=false. So we walk the message tree first, then
+  // decide whether to render based on whether ANY indicator surfaces.
   const indicators: Indicator[] = [];
 
-  // 1. Idle-while-busy pulse
-  indicators.push({
-    id: "working",
-    kind: "working",
-    elapsed: Math.floor((now - session.lastEventAt) / 1000),
-    sortAt: session.lastEventAt,
-  });
+  if (session.busy && idleMs > SILENCE_MS) {
+    indicators.push({
+      id: "working",
+      kind: "working",
+      elapsed: Math.floor((now - session.lastEventAt) / 1000),
+      sortAt: session.lastEventAt,
+    });
+  }
 
-  // 2 + 3. Walk message history for outstanding wake/bg-task tools
   for (const m of session.messages) {
     if (m.role !== "assistant") continue;
     for (const b of m.blocks) {
@@ -107,6 +99,16 @@ export default function SessionActivity({ session }: { session: SessionData }) {
   // Newest first, then cap.
   indicators.sort((a, b) => b.sortAt - a.sortAt);
   const visible = indicators.slice(0, MAX_CHIPS);
+
+  // Tick the clock whenever there's something to render — covers both the
+  // busy-pulse case AND any outstanding bg-task/wakeup so the elapsed timer
+  // and countdown stay live even after claude's turn ended.
+  const hasLiveIndicator = visible.length > 0;
+  useEffect(() => {
+    if (!hasLiveIndicator) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [hasLiveIndicator]);
 
   if (visible.length === 0) return null;
 
@@ -205,12 +207,22 @@ function formatRemaining(ms: number): string {
 }
 
 function bgTaskShortName(tool: ToolCall): string | undefined {
-  // For Bash, try to surface a short hint about what's running.
   const cmd: string | undefined = tool.input?.command;
   if (!cmd) return undefined;
-  const first = cmd.trim().split(/\s+/)[0];
-  if (!first) return undefined;
-  const trimmed = first.split(/[\\/]/).pop() || first;
+  // Walk tokens, skipping shell env-var prefixes (FOO=bar BAZ="qux")
+  // until we find the actual program name. Without this, commands like
+  // `PATH="..." npm run build` would label as the env var instead of npm.
+  const tokens = cmd.trim().split(/\s+/);
+  let program: string | undefined;
+  for (const tok of tokens) {
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) continue;
+    program = tok;
+    break;
+  }
+  if (!program) return undefined;
+  // Strip surrounding quotes and any leading directory path.
+  const cleaned = program.replace(/^["']|["']$/g, "");
+  const trimmed = cleaned.split(/[\\/]/).pop() || cleaned;
   return trimmed.length > 24 ? trimmed.slice(0, 24) + "…" : trimmed;
 }
 
