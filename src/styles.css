@@ -892,6 +892,73 @@ body,
   100% { opacity: 0; }
 }
 
+/* Connection-status toast — fixed bottom-center, app-wide. Appears when
+   the browser flips offline; replaced by a brief "Reconnected" toast on
+   recovery. Stays visible (no auto-fade) while offline so the user always
+   has the explanation in front of them. */
+.connection-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 50;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-family: var(--font-ui);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  pointer-events: none;
+}
+
+.connection-toast-offline {
+  background: rgba(64, 22, 28, 0.92);
+  border: 1px solid rgba(255, 120, 120, 0.4);
+  color: #ffc1c1;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+}
+
+.connection-toast-online {
+  background: rgba(20, 50, 28, 0.92);
+  border: 1px solid rgba(120, 220, 140, 0.45);
+  color: #b9f0c2;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  animation: connection-toast-fade 3s ease forwards;
+}
+
+.connection-toast-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.connection-toast-offline .connection-toast-dot {
+  background: #ff8585;
+  box-shadow: 0 0 6px rgba(255, 133, 133, 0.6);
+  animation: connection-dot-pulse 1.4s ease-in-out infinite;
+}
+
+.connection-toast-online .connection-toast-dot {
+  background: #6ad97f;
+  box-shadow: 0 0 6px rgba(106, 217, 127, 0.7);
+}
+
+@keyframes connection-dot-pulse {
+  0%, 100% { opacity: 0.55; }
+  50%      { opacity: 1; }
+}
+
+@keyframes connection-toast-fade {
+  0%   { opacity: 0; transform: translate(-50%, 6px); }
+  12%  { opacity: 1; transform: translate(-50%, 0); }
+  80%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+
 .chat-error {
   background: rgba(74, 14, 12, 0.85);
   border-top: 1px solid rgba(170, 31, 31, 0.5);

@@ -37,6 +37,46 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [usage, setUsage] = useState<UsageSnapshot | null>(null);
   const [sessions, setSessions] = useState<Record<string, SessionData>>({});
+  // Network status. While offline, every claude API call is doomed; rather
+  // than firing the watchdog and showing "no response from claude" errors,
+  // surface the real cause and pause the watchdog. When the connection
+  // returns, briefly toast "Reconnected" so the user knows the chat is live
+  // again.
+  const [online, setOnline] = useState<boolean>(
+    typeof navigator !== "undefined" ? navigator.onLine : true,
+  );
+  const [offlineSince, setOfflineSince] = useState<number | null>(null);
+  const [reconnectedAt, setReconnectedAt] = useState<number | null>(null);
+  const offlineSinceRef = useRef<number | null>(null);
+  useEffect(() => {
+    offlineSinceRef.current = offlineSince;
+  }, [offlineSince]);
+  useEffect(() => {
+    const onOnline = () => {
+      setOnline(true);
+      setOfflineSince(null);
+      setReconnectedAt(Date.now());
+    };
+    const onOffline = () => {
+      setOnline(false);
+      setOfflineSince(Date.now());
+      setReconnectedAt(null);
+    };
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    // Sync once on mount in case the page loaded already-offline.
+    if (typeof navigator !== "undefined" && !navigator.onLine) onOffline();
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  }, []);
+  // Auto-clear the "Reconnected" toast after a few seconds.
+  useEffect(() => {
+    if (!reconnectedAt) return;
+    const id = setTimeout(() => setReconnectedAt(null), 3000);
+    return () => clearTimeout(id);
+  }, [reconnectedAt]);
   // Multiple chats can be visible side-by-side (up to MAX_VISIBLE_PANES).
   // The first key in visibleKeys is the "primary" — used for the usage pill,
   // titlebar focus, and as the default destination when starting new chats.
@@ -449,9 +489,12 @@ export default function App() {
     return () => clearInterval(interval);
   }, [updateSession]);
 
-  // Watchdog: if a session has been busy with no event for >45s, force-clear.
+  // Watchdog: if a session has been busy with no event for >5min, force-clear.
+  // While offline, skip — the silence is the network's fault, not claude's,
+  // and firing this would just produce a misleading error banner.
   useEffect(() => {
     const interval = setInterval(() => {
+      if (offlineSinceRef.current !== null) return;
       const now = Date.now();
       const all = sessionsRef.current;
       for (const s of Object.values(all)) {
@@ -601,6 +644,20 @@ export default function App() {
           ))
         )}
       </div>
+      {!online && (
+        <div className="connection-toast connection-toast-offline" role="status">
+          <span className="connection-toast-dot" aria-hidden="true" />
+          <span className="connection-toast-label">
+            Internet connection dropped — your work resumes when it&apos;s back.
+          </span>
+        </div>
+      )}
+      {online && reconnectedAt && (
+        <div className="connection-toast connection-toast-online" role="status">
+          <span className="connection-toast-dot" aria-hidden="true" />
+          <span className="connection-toast-label">Reconnected</span>
+        </div>
+      )}
       <span className="signature">Victor Braga</span>
       <Sidebar
         open={sidebarOpen}
