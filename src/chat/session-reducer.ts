@@ -357,11 +357,23 @@ export function replaySession(jsonl: string, s: SessionData): SessionData {
       cur = handleAssistantMessage(cur, obj.message);
     }
   }
-  // mark all bubbles as complete
+  // Mark all bubbles as complete AND wipe startedAt on every tool_use. Live
+  // event handlers stamp Date.now() on each tool when it appears, which is
+  // correct for active sessions but wrong here — without this, every tool
+  // from the historical JSONL would look like it just started, polluting the
+  // activity strip with phantom bg-task chips on app launch.
   return {
     ...cur,
     currentTurnId: null,
-    messages: cur.messages.map((m) => ({ ...m, streaming: false })),
+    messages: cur.messages.map((m) => ({
+      ...m,
+      streaming: false,
+      blocks: m.blocks.map((b) =>
+        b.kind === "tool_use"
+          ? { ...b, tool: { ...b.tool, startedAt: undefined } }
+          : b,
+      ),
+    })),
   };
 }
 

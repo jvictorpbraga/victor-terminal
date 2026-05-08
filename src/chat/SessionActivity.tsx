@@ -29,7 +29,6 @@ type Indicator =
 
 const BG_TASK_MAX_MS = 10 * 60 * 1000; // hide bg-task chips after 10 min
 const SILENCE_MS = 2000;               // claude must be quiet this long
-const MAX_CHIPS = 3;                   // cap to avoid screen spam
 
 export default function SessionActivity({ session }: { session: SessionData }) {
   const [now, setNow] = useState(Date.now());
@@ -96,9 +95,23 @@ export default function SessionActivity({ session }: { session: SessionData }) {
     }
   }
 
-  // Newest first, then cap.
-  indicators.sort((a, b) => b.sortAt - a.sortAt);
-  const visible = indicators.slice(0, MAX_CHIPS);
+  // Collapse all bg-task indicators into a single chip — one "running in
+  // background" chip is enough; multiple create visual noise. The chip's
+  // timer reflects the OLDEST running task, signalling the longest wait so
+  // the user can tell whether something has been chugging for a while.
+  const collapsed: Indicator[] = [];
+  let oldestBg: Indicator | null = null;
+  for (const ind of indicators) {
+    if (ind.kind === "bg-task") {
+      if (!oldestBg || ind.sortAt < oldestBg.sortAt) oldestBg = ind;
+    } else {
+      collapsed.push(ind);
+    }
+  }
+  if (oldestBg) collapsed.push(oldestBg);
+  // Newest indicator first (so working pulse comes before older bg-task).
+  collapsed.sort((a, b) => b.sortAt - a.sortAt);
+  const visible = collapsed;
 
   // Tick the clock whenever there's something to render — covers both the
   // busy-pulse case AND any outstanding bg-task/wakeup so the elapsed timer
@@ -161,7 +174,6 @@ function WakePill({ remainingMs }: { remainingMs: number }) {
 }
 
 function BgTaskPill({
-  toolName,
   elapsedMs,
   reason,
 }: {
@@ -174,8 +186,7 @@ function BgTaskPill({
     <>
       <span className="activity-icon">⏵</span>
       <span className="activity-label">
-        {toolName.toLowerCase()}
-        {reason ? ` · ${reason}` : ""}
+        running in background{reason ? `: ${reason}` : ""}
       </span>
       <span className="activity-meta">{formatSecs(elapsed)}</span>
     </>
