@@ -1,17 +1,29 @@
-// Claude Code subprocess manager — spawns `claude --print --input-format=stream-json
-// --output-format=stream-json` and brokers JSON line events to the frontend
-// over Tauri events. This replaces the xterm/PTY approach for V2 (chat UI).
+// Claude Code subprocess manager — supports MULTIPLE concurrent claude sessions
+// (one per app-side chat). Each session is keyed by an opaque string the
+// frontend assigns; commands route to the right subprocess by that key.
+//
+// Frontend lifecycle:
+//   1. invoke claude_start({ key, args }) when a chat is created/resumed
+//   2. invoke claude_send({ key, json_line }) for each user turn
+//   3. invoke claude_stop({ key }) when the user explicitly closes the chat
+//   4. invoke claude_stop_all() when the window is closing
+//
+// Reader threads emit `claude-event` events with payload {"key": "<key>",
+// "line": "<original stdout line>"} so the frontend can route to the right
+// chat state. `claude-stderr` and `claude-exit` follow the same shape.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tauri::{AppHandle, Emitter, State};
 
 #[derive(Default)]
 pub struct ClaudeSessionState {
-    inner: Mutex<Option<Instance>>,
+    inner: Mutex<HashMap<String, Instance>>,
 }
 
 struct Instance {
@@ -31,12 +43,17 @@ pub struct StartArgs {
 pub fn claude_start(
     app: AppHandle,
     state: State<'_, ClaudeSessionState>,
+    key: String,
     args: StartArgs,
 ) -> Result<(), String> {
-    // If already running, kill first.
+    if key.is_empty() {
+        return Err("session key required".into());
+    }
+
+    // Kill any existing instance for THIS key (e.g. on model switch / refresh).
     {
         let mut guard = state.inner.lock().unwrap();
-        if let Some(mut prev) = guard.take() {
+        if let Some(mut prev) = guard.remove(&key) {
             let _ = prev.child.kill();
         }
     }
@@ -61,7 +78,6 @@ pub fn claude_start(
             cmd.arg("--resume").arg(id);
         }
     }
-
     if let Some(p) = &args.append_system_prompt {
         if !p.is_empty() {
             cmd.arg("--append-system-prompt").arg(p);
@@ -80,7 +96,6 @@ pub fn claude_start(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // Hide console window on Windows for the spawned child.
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -93,54 +108,89 @@ pub fn claude_start(
     let stderr = child.stderr.take().ok_or("no stderr")?;
 
     let app_out = app.clone();
+    let key_out = key.clone();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             match line {
                 Ok(l) if !l.trim().is_empty() => {
-                    let _ = app_out.emit("claude-event", l);
+                    let payload = json!({ "key": &key_out, "line": l }).to_string();
+                    let _ = app_out.emit("claude-event", payload);
                 }
                 Ok(_) => {}
                 Err(_) => break,
             }
         }
-        let _ = app_out.emit("claude-exit", ());
+        let payload = json!({ "key": &key_out }).to_string();
+        let _ = app_out.emit("claude-exit", payload);
     });
 
     let app_err = app.clone();
+    let key_err = key.clone();
     std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
             if let Ok(l) = line {
                 if !l.trim().is_empty() {
-                    let _ = app_err.emit("claude-stderr", l);
+                    let payload = json!({ "key": &key_err, "line": l }).to_string();
+                    let _ = app_err.emit("claude-stderr", payload);
                 }
             }
         }
     });
 
-    *state.inner.lock().unwrap() = Some(Instance { child, stdin });
+    state
+        .inner
+        .lock()
+        .unwrap()
+        .insert(key, Instance { child, stdin });
     Ok(())
 }
 
 #[tauri::command]
-pub fn claude_send(state: State<'_, ClaudeSessionState>, json_line: String) -> Result<(), String> {
+pub fn claude_send(
+    state: State<'_, ClaudeSessionState>,
+    key: String,
+    json_line: String,
+) -> Result<(), String> {
     let mut guard = state.inner.lock().unwrap();
-    let inst = guard.as_mut().ok_or("claude session not started")?;
+    let inst = guard
+        .get_mut(&key)
+        .ok_or_else(|| format!("session {} not started", key))?;
     writeln!(inst.stdin, "{}", json_line.trim_end()).map_err(|e| e.to_string())?;
     inst.stdin.flush().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn claude_stop(state: State<'_, ClaudeSessionState>) -> Result<(), String> {
+pub fn claude_stop(
+    state: State<'_, ClaudeSessionState>,
+    key: String,
+) -> Result<(), String> {
     let mut guard = state.inner.lock().unwrap();
-    if let Some(mut inst) = guard.take() {
+    if let Some(mut inst) = guard.remove(&key) {
         let _ = inst.child.kill();
     }
     Ok(())
 }
 
 #[tauri::command]
-pub fn claude_running(state: State<'_, ClaudeSessionState>) -> bool {
-    state.inner.lock().unwrap().is_some()
+pub fn claude_stop_all(state: State<'_, ClaudeSessionState>) -> Result<(), String> {
+    let mut guard = state.inner.lock().unwrap();
+    let keys: Vec<String> = guard.keys().cloned().collect();
+    for k in keys {
+        if let Some(mut inst) = guard.remove(&k) {
+            let _ = inst.child.kill();
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn claude_running(state: State<'_, ClaudeSessionState>, key: String) -> bool {
+    state.inner.lock().unwrap().contains_key(&key)
+}
+
+#[tauri::command]
+pub fn claude_active_keys(state: State<'_, ClaudeSessionState>) -> Vec<String> {
+    state.inner.lock().unwrap().keys().cloned().collect()
 }

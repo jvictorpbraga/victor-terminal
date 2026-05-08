@@ -1,8 +1,21 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import Chat from "./chat/Chat";
 import Sidebar from "./chat/Sidebar";
+import {
+  applySessionEvent,
+  deriveSessionTitle,
+  replaySession,
+} from "./chat/session-reducer";
+import {
+  emptySession,
+  makeSessionKey,
+  type Attachment,
+  type ChatMessage,
+  type SessionData,
+} from "./chat/types";
 
 type UsageSnapshot = {
   session_id: string;
@@ -13,27 +26,474 @@ type UsageSnapshot = {
   used_pct: number;
 };
 
+const RESTART_THRESHOLD_PCT = 75;
+const RESTART_IDLE_MS = 5000;
+// Long tools (builds, big fetches, image gen) routinely run >1m with no stream
+// events. Keep this generous so the input doesn't unlock under the user.
+const WATCHDOG_BUSY_TIMEOUT_MS = 300_000;
+
 export default function App() {
   const win = getCurrentWindow();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [usage, setUsage] = useState<UsageSnapshot | null>(null);
-  const usageRef = useRef<UsageSnapshot | null>(null);
-  // resumeId drives Chat — change it (via key) to load a different session.
-  const [resumeId, setResumeId] = useState<string | null>(null);
-  // Bumping chatKey forces a fresh Chat mount even when resumeId is unchanged
-  // (e.g. user clicks "+ New chat" with no current resumeId).
-  const [chatKey, setChatKey] = useState(0);
+  const [sessions, setSessions] = useState<Record<string, SessionData>>({});
+  // Multiple chats can be visible side-by-side (up to MAX_VISIBLE_PANES).
+  // The first key in visibleKeys is the "primary" — used for the usage pill,
+  // titlebar focus, and as the default destination when starting new chats.
+  const [visibleKeys, setVisibleKeys] = useState<string[]>([]);
 
+  const sessionsRef = useRef(sessions);
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
+  const visibleKeysRef = useRef(visibleKeys);
+  useEffect(() => {
+    visibleKeysRef.current = visibleKeys;
+  }, [visibleKeys]);
+
+  // Mutate one session in place, immutably.
+  const updateSession = useCallback(
+    (key: string, fn: (s: SessionData) => SessionData) => {
+      setSessions((prev) => {
+        const cur = prev[key];
+        if (!cur) return prev;
+        return { ...prev, [key]: fn(cur) };
+      });
+    },
+    [],
+  );
+
+  // ---- Session lifecycle -------------------------------------------------
+
+  /** Create an empty in-app chat with the welcome screen. We DO NOT spawn the
+   *  claude subprocess here — that happens lazily on the first user message
+   *  via ensureClaudeSpawned. Opening + closing the app should not leave a
+   *  stray empty ledger entry on disk. */
+  const startNewChat = useCallback(() => {
+    const key = makeSessionKey();
+    const session = emptySession({ key });
+    setSessions((prev) => ({ ...prev, [key]: session }));
+    setVisibleKeys([key]);
+  }, []);
+
+  /** Ensure claude is running for this key; spawn it on demand the first time. */
+  const ensureClaudeSpawned = useCallback(
+    async (key: string): Promise<boolean> => {
+      const cur = sessionsRef.current[key];
+      if (!cur) return false;
+      if (cur.claudeSpawned) return true;
+      // Mark spawned BEFORE the await so concurrent sends don't double-start.
+      updateSession(key, (s) => ({ ...s, claudeSpawned: true }));
+      try {
+        await invoke("claude_start", {
+          key,
+          args: {
+            model: cur.model,
+            resume: cur.resumeId,
+            cwd: null,
+            append_system_prompt: null,
+          },
+        });
+        return true;
+      } catch (e) {
+        updateSession(key, (s) => ({
+          ...s,
+          claudeSpawned: false,
+          error: String(e),
+        }));
+        return false;
+      }
+    },
+    [updateSession],
+  );
+
+  /** Add a chat to the visible row (no upper limit) without closing the others. */
+  const showAlongside = useCallback((key: string) => {
+    setVisibleKeys((prev) => {
+      if (prev.includes(key)) return prev;
+      return [...prev, key];
+    });
+  }, []);
+
+  /** Replace the visible row with just this one chat — single-pane swap. */
+  const swapToOnly = useCallback((key: string) => {
+    setVisibleKeys([key]);
+  }, []);
+
+  /** Make this chat the only visible one. */
+  const focusOnly = useCallback((key: string) => {
+    setVisibleKeys([key]);
+  }, []);
+
+  /** Hide this chat from view (it keeps running in the background). */
+  const minimizeChat = useCallback((key: string) => {
+    setVisibleKeys((prev) => {
+      const next = prev.filter((k) => k !== key);
+      if (next.length === 0) {
+        // Don't leave the user with no panes — fall back to ANY remaining session.
+        const remaining = Object.keys(sessionsRef.current).filter((k) => k !== key);
+        if (remaining[0]) return [remaining[0]];
+      }
+      return next;
+    });
+  }, []);
+
+  const resumeFromPast = useCallback(
+    async (resumeId: string) => {
+      // If a chat is already open for this resumeId, just bring it into view.
+      const existing = Object.values(sessionsRef.current).find(
+        (s) => s.resumeId === resumeId || s.resolvedSessionId === resumeId,
+      );
+      if (existing) {
+        showAlongside(existing.key);
+        return;
+      }
+
+      const key = makeSessionKey();
+      const stub = emptySession({ key, resumeId, resolvedSessionId: resumeId });
+      setSessions((prev) => ({ ...prev, [key]: stub }));
+      setVisibleKeys([key]);
+
+      try {
+        const jsonl = await invoke<string>("ledger_get_session_jsonl", {
+          sessionId: resumeId,
+          cwd: null,
+        });
+        updateSession(key, (s) => {
+          const replayed = replaySession(jsonl, s);
+          return { ...replayed, title: deriveSessionTitle(replayed) ?? s.title };
+        });
+      } catch (e) {
+        updateSession(key, (s) => ({ ...s, error: String(e) }));
+      }
+
+      try {
+        await invoke("claude_start", {
+          key,
+          args: {
+            model: stub.model,
+            resume: resumeId,
+            cwd: null,
+            append_system_prompt: null,
+          },
+        });
+        updateSession(key, (s) => ({ ...s, claudeSpawned: true }));
+      } catch (e) {
+        updateSession(key, (s) => ({ ...s, error: String(e) }));
+      }
+    },
+    [updateSession],
+  );
+
+  const closeSession = useCallback(
+    async (key: string) => {
+      try {
+        await invoke("claude_stop", { key });
+      } catch {}
+      setSessions((prev) => {
+        const { [key]: _, ...rest } = prev;
+        return rest;
+      });
+      setVisibleKeys((prev) => {
+        const next = prev.filter((k) => k !== key);
+        if (next.length === 0) {
+          const remaining = Object.keys(sessionsRef.current).filter((k) => k !== key);
+          if (remaining[0]) return [remaining[0]];
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  // ---- Outgoing actions --------------------------------------------------
+
+  const sendMessage = useCallback(
+    async (key: string, text: string, attachments: Attachment[]) => {
+      const session = sessionsRef.current[key];
+      if (!session) return;
+      if (session.busy) return;
+
+      // Spawn the claude subprocess on the very first message of this chat.
+      // This keeps the welcome screen weightless (no ledger entry) until the
+      // user actually starts a conversation.
+      if (!session.claudeSpawned) {
+        const ok = await ensureClaudeSpawned(key);
+        if (!ok) return;
+      }
+
+      const userMsg: ChatMessage = {
+        id: `u-${Date.now()}`,
+        role: "user",
+        blocks: text ? [{ kind: "text", text }] : [],
+        timestamp: Date.now(),
+        attachments: attachments.length ? attachments : undefined,
+      };
+
+      updateSession(key, (s) => ({
+        ...s,
+        messages: [...s.messages, userMsg],
+        busy: true,
+        currentTurnId: null,
+        turnFinalizedCount: 0,
+        title: s.title ?? (text ? (text.length > 60 ? text.slice(0, 60) + "…" : text) : null),
+        lastEventAt: Date.now(),
+      }));
+
+      let content: any;
+      if (attachments.length === 0) {
+        content = text;
+      } else {
+        const blocks: any[] = [];
+        if (text) blocks.push({ type: "text", text });
+        for (const a of attachments) {
+          if (a.kind === "image" && a.base64 && a.mediaType) {
+            blocks.push({
+              type: "image",
+              source: { type: "base64", media_type: a.mediaType, data: a.base64 },
+            });
+          } else if (a.kind === "file") {
+            blocks.push({
+              type: "text",
+              text: `(attached file: ${a.name}${a.path ? ` at ${a.path}` : ""})`,
+            });
+          }
+        }
+        content = blocks;
+      }
+
+      const payload = {
+        type: "user",
+        message: { role: "user", content },
+      };
+      invoke("claude_send", { key, jsonLine: JSON.stringify(payload) }).catch((e) =>
+        updateSession(key, (s) => ({ ...s, error: String(e) })),
+      );
+    },
+    [updateSession, ensureClaudeSpawned],
+  );
+
+  const interruptSession = useCallback(
+    async (key: string) => {
+      const session = sessionsRef.current[key];
+      if (!session) return;
+      try {
+        await invoke("claude_stop", { key });
+      } catch {}
+      updateSession(key, (s) => ({
+        ...s,
+        busy: false,
+        currentTurnId: null,
+        turnFinalizedCount: 0,
+        claudeSpawned: false,
+        messages: s.messages.map((m) =>
+          m.streaming ? { ...m, streaming: false } : m,
+        ),
+      }));
+      // Restart fresh (resume resolved session id if we have one so the
+      // ledger continues into the same JSONL).
+      try {
+        await invoke("claude_start", {
+          key,
+          args: {
+            model: session.model,
+            resume: session.resolvedSessionId,
+            cwd: null,
+            append_system_prompt: null,
+          },
+        });
+        updateSession(key, (s) => ({ ...s, claudeSpawned: true }));
+      } catch (e) {
+        updateSession(key, (s) => ({ ...s, error: String(e) }));
+      }
+    },
+    [updateSession],
+  );
+
+  const changeModel = useCallback(
+    async (key: string, slug: string) => {
+      const session = sessionsRef.current[key];
+      if (!session) return;
+      if (session.model === slug) return;
+      try {
+        await invoke("claude_stop", { key });
+      } catch {}
+      // Model change wipes the chat back to the welcome screen — leave claude
+      // unspawned so the user's first message under the new model is what
+      // creates the next ledger entry.
+      updateSession(key, (s) => ({
+        ...s,
+        model: slug,
+        messages: [],
+        currentTurnId: null,
+        busy: false,
+        resolvedSessionId: null,
+        claudeSpawned: false,
+      }));
+    },
+    [updateSession],
+  );
+
+  // ---- Event listeners ---------------------------------------------------
+
+  // claude-event: route every line by key into the right session reducer.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<string>("claude-event", (event) => {
+      let wrapped: any;
+      try {
+        wrapped = JSON.parse(event.payload);
+      } catch {
+        return;
+      }
+      const key: string | undefined = wrapped.key;
+      const lineStr: string | undefined = wrapped.line;
+      if (!key || !lineStr) return;
+      let obj: any;
+      try {
+        obj = JSON.parse(lineStr);
+      } catch {
+        return;
+      }
+      setSessions((prev) => {
+        const cur = prev[key];
+        if (!cur) return prev;
+        return { ...prev, [key]: applySessionEvent(cur, obj) };
+      });
+    }).then((fn) => (unlisten = fn));
+    return () => unlisten?.();
+  }, []);
+
+  // session-usage: just remember the latest snapshot for the auto-refresh tick.
+  const lastUsageRef = useRef<UsageSnapshot | null>(null);
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     listen<UsageSnapshot>("session-usage", (event) => {
       setUsage(event.payload);
-      usageRef.current = event.payload;
-    }).then((fn) => {
-      unlisten = fn;
-    });
+      lastUsageRef.current = event.payload;
+    }).then((fn) => (unlisten = fn));
     return () => unlisten?.();
   }, []);
+
+  // Auto-refresh (75% threshold, 5s idle) — runs once globally and matches the
+  // hot session by claude session_id against any of our sessions' resolvedSessionId.
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      const u = lastUsageRef.current;
+      if (!u) return;
+      if (u.used_pct < RESTART_THRESHOLD_PCT) return;
+      const all = sessionsRef.current;
+      const target = Object.values(all).find(
+        (s) => s.resolvedSessionId === u.session_id,
+      );
+      if (!target) return;
+      if (target.refreshedFor.includes(u.session_id)) return;
+      const idleFor = Date.now() - target.lastEventAt;
+      if (idleFor < RESTART_IDLE_MS) return;
+
+      // Mark refreshed first so we don't double-fire while restarting.
+      updateSession(target.key, (s) => ({
+        ...s,
+        refreshedFor: [...s.refreshedFor, u.session_id],
+        refreshNotice: `Refreshing context (was at ${Math.round(u.used_pct)}%)…`,
+      }));
+
+      let sessionsDir = "";
+      try {
+        sessionsDir = await invoke<string>("get_sessions_dir");
+      } catch {}
+      const ledgerPath = sessionsDir
+        ? `${sessionsDir}\\${u.session_id}.md`
+        : `${u.session_id}.md`;
+      let ledger = "";
+      try {
+        ledger = await invoke<string>("read_session_ledger", {
+          sessionId: u.session_id,
+        });
+      } catch {}
+      const tail = ledger.slice(Math.max(0, ledger.length - 18000));
+      const note =
+        `The previous internal session reached ${Math.round(u.used_pct)}% of the model context limit ` +
+        `and was transparently restarted by Victor Terminal so the conversation can continue without interruption. ` +
+        `Below is the recent narrative from that session's ledger. Continue the conversation naturally — to the user, ` +
+        `nothing happened. The full ledger is at ${ledgerPath} — read it via the Read tool if you need older context.\n\n` +
+        `--- RECENT SESSION LEDGER (tail) ---\n` +
+        tail +
+        `\n--- END LEDGER ---`;
+
+      try {
+        await invoke("claude_start", {
+          key: target.key,
+          args: {
+            model: target.model,
+            resume: null,
+            cwd: null,
+            append_system_prompt: note,
+          },
+        });
+        updateSession(target.key, (s) => ({
+          ...s,
+          refreshNotice: "Context refreshed in the background",
+        }));
+        setTimeout(() => {
+          updateSession(target.key, (s) => ({ ...s, refreshNotice: null }));
+        }, 3500);
+      } catch (e) {
+        updateSession(target.key, (s) => ({
+          ...s,
+          error: `auto-refresh failed: ${e}`,
+          refreshNotice: null,
+        }));
+      }
+    }, 1500);
+    return () => clearInterval(interval);
+  }, [updateSession]);
+
+  // Watchdog: if a session has been busy with no event for >45s, force-clear.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const now = Date.now();
+      const all = sessionsRef.current;
+      for (const s of Object.values(all)) {
+        if (!s.busy) continue;
+        if (s.lastEventAt === 0) continue;
+        if (now - s.lastEventAt > WATCHDOG_BUSY_TIMEOUT_MS) {
+          updateSession(s.key, (cur) => ({
+            ...cur,
+            busy: false,
+            currentTurnId: null,
+            messages: cur.messages.map((m) =>
+              m.streaming ? { ...m, streaming: false } : m,
+            ),
+            error:
+              cur.error ??
+              "No response from claude in 5 minutes — input unlocked. Try again.",
+          }));
+        }
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [updateSession]);
+
+  // Stop every session when the window is closing.
+  useEffect(() => {
+    const handler = () => {
+      invoke("claude_stop_all").catch(() => {});
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, []);
+
+  // Spawn an empty chat shell on launch — welcome screen, no claude subprocess
+  // yet. The actual claude_start fires lazily on the first user message.
+  useEffect(() => {
+    if (Object.keys(sessionsRef.current).length === 0) {
+      startNewChat();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---- Title-bar usage pill ---------------------------------------------
 
   const usagePctRounded = usage ? Math.min(100, Math.round(usage.used_pct)) : null;
   const usageColor =
@@ -45,15 +505,13 @@ export default function App() {
       ? "usage-warn"
       : "";
 
-  const onSelectSession = (id: string) => {
-    setResumeId(id);
-    setChatKey((k) => k + 1);
-  };
+  // ---- Render ------------------------------------------------------------
 
-  const onNewChat = () => {
-    setResumeId(null);
-    setChatKey((k) => k + 1);
-  };
+  const activeSessions = Object.values(sessions);
+  const visiblePanes = visibleKeys
+    .map((k) => sessions[k])
+    .filter((s): s is SessionData => !!s);
+  const primaryKey = visibleKeys[0] ?? null;
 
   return (
     <div className="app">
@@ -61,6 +519,11 @@ export default function App() {
         <div className="titlebar-drag" data-tauri-drag-region>
           <span className="titlebar-title">
             <span>Victor Terminal</span>
+            {activeSessions.length > 1 && (
+              <span className="titlebar-count" title="Active chats">
+                {activeSessions.length}
+              </span>
+            )}
             {usagePctRounded != null && (
               <span
                 className={`usage-pill ${usageColor}`}
@@ -114,14 +577,51 @@ export default function App() {
           />
         </svg>
       </button>
-      <Chat key={chatKey} resumeId={resumeId} />
+      <div className={`chat-row chat-row-${visiblePanes.length}`}>
+        {visiblePanes.length === 0 ? (
+          <div className="chat" />
+        ) : (
+          visiblePanes.map((session) => (
+            <Chat
+              key={session.key}
+              session={session}
+              showHeader={visiblePanes.length > 1}
+              canFocusOnly={visiblePanes.length > 1}
+              onSend={(text, attachments) =>
+                sendMessage(session.key, text, attachments)
+              }
+              onChangeModel={(slug) => changeModel(session.key, slug)}
+              onInterrupt={() => interruptSession(session.key)}
+              onDismissError={() =>
+                updateSession(session.key, (s) => ({ ...s, error: null }))
+              }
+              onMinimize={() => minimizeChat(session.key)}
+              onFocusOnly={() => focusOnly(session.key)}
+            />
+          ))
+        )}
+      </div>
       <span className="signature">Victor Braga</span>
       <Sidebar
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
-        activeId={resumeId}
-        onSelectSession={onSelectSession}
-        onNewChat={onNewChat}
+        primaryKey={primaryKey}
+        visibleKeys={visibleKeys}
+        activeSessions={activeSessions}
+        onSwapToOnly={(key) => {
+          swapToOnly(key);
+          setSidebarOpen(false);
+        }}
+        onShowAlongside={(key) => {
+          showAlongside(key);
+        }}
+        onMinimizeFromView={(key) => minimizeChat(key)}
+        onCloseActiveSession={closeSession}
+        onSelectPastSession={resumeFromPast}
+        onNewChat={() => {
+          startNewChat();
+          setSidebarOpen(false);
+        }}
       />
     </div>
   );

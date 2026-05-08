@@ -34,7 +34,9 @@ pub fn run() {
             claude_session::claude_start,
             claude_session::claude_send,
             claude_session::claude_stop,
+            claude_session::claude_stop_all,
             claude_session::claude_running,
+            claude_session::claude_active_keys,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -18,13 +18,21 @@ const VOICE_LANGS = [
 ];
 
 type Props = {
-  disabled?: boolean;
+  busy?: boolean;
   model: string;
   onChangeModel: (slug: string) => void;
   onSend: (text: string, attachments: Attachment[]) => void;
+  onInterrupt: () => void;
 };
 
-export default function PromptBar({ disabled, model, onChangeModel, onSend }: Props) {
+export default function PromptBar({
+  busy,
+  model,
+  onChangeModel,
+  onSend,
+  onInterrupt,
+}: Props) {
+  const disabled = false;
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [showModels, setShowModels] = useState(false);
@@ -51,7 +59,7 @@ export default function PromptBar({ disabled, model, onChangeModel, onSend }: Pr
   }, [text]);
 
   const trySend = () => {
-    if (disabled) return;
+    if (busy) return; // queueing not supported yet — user must stop or wait
     const t = text.trim();
     if (!t && attachments.length === 0) return;
     onSend(t, attachments);
@@ -62,6 +70,10 @@ export default function PromptBar({ disabled, model, onChangeModel, onSend }: Pr
   const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      if (busy) {
+        // Don't send while busy — show a hint, but keep input editable.
+        return;
+      }
       trySend();
     }
   };
@@ -261,13 +273,18 @@ export default function PromptBar({ disabled, model, onChangeModel, onSend }: Pr
         <textarea
           ref={taRef}
           className="promptbar-input"
-          placeholder={listening ? "Listening…" : "Message Victor Terminal…"}
+          placeholder={
+            listening
+              ? "Listening…"
+              : busy
+              ? "Claude is working… type to draft, click ⏹ to interrupt"
+              : "Message Victor Terminal…"
+          }
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKey}
           onPaste={onPaste}
           rows={1}
-          disabled={disabled}
         />
         <div className={`mic-wrap ${showLangPicker ? "lang-open" : ""}`}>
           <div className="mic-popover" role="group" aria-label="Voice options">
@@ -349,14 +366,27 @@ export default function PromptBar({ disabled, model, onChangeModel, onSend }: Pr
             {listening && <span className="mic-pulse" aria-hidden="true" />}
           </button>
         </div>
-        <button
-          className="promptbar-send"
-          onClick={trySend}
-          disabled={disabled || (!text.trim() && attachments.length === 0)}
-          title={disabled ? "Waiting for response…" : "Send (Enter)"}
-        >
-          ↑
-        </button>
+        {busy ? (
+          <button
+            className="promptbar-send promptbar-stop"
+            onClick={onInterrupt}
+            title="Interrupt claude"
+            aria-label="Interrupt claude"
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+              <rect x="1" y="1" width="8" height="8" rx="1" fill="currentColor" />
+            </svg>
+          </button>
+        ) : (
+          <button
+            className="promptbar-send"
+            onClick={trySend}
+            disabled={!text.trim() && attachments.length === 0}
+            title="Send (Enter)"
+          >
+            ↑
+          </button>
+        )}
       </div>
     </div>
   );
